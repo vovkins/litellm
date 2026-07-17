@@ -7,7 +7,7 @@ from litellm.exceptions import AuthenticationError
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.types.llms.openai import AllMessageValues
 
-from ..authenticator import Authenticator, get_chatgpt_auth_file
+from ..authenticator import Authenticator, get_cached_authenticator, get_chatgpt_auth_file
 from ..common_utils import (
     GetAccessTokenError,
     ensure_chatgpt_session_id,
@@ -29,7 +29,7 @@ class ChatGPTConfig(OpenAIConfig):
     def _resolve_authenticator(self, litellm_params: Mapping[str, object] | BaseModel | None) -> Authenticator:
         auth_file: Final = get_chatgpt_auth_file(litellm_params)
         if auth_file:
-            return Authenticator(auth_file=auth_file)
+            return get_cached_authenticator(auth_file)
         return self.authenticator
 
     @staticmethod
@@ -66,11 +66,10 @@ class ChatGPTConfig(OpenAIConfig):
         api_key: str | None = None,
         api_base: str | None = None,
     ) -> dict:
-        authenticator: Final = self._resolve_authenticator(litellm_params)
+        auth_file: Final = get_chatgpt_auth_file(litellm_params)
+        authenticator: Final = get_cached_authenticator(auth_file) if auth_file else self.authenticator
         resolved_api_key: Final = (
-            self._get_access_token_or_raise(authenticator, model, "chatgpt")
-            if get_chatgpt_auth_file(litellm_params)
-            else api_key
+            self._get_access_token_or_raise(authenticator, model, "chatgpt") if auth_file else api_key
         )
 
         validated_headers: Final = super().validate_environment(

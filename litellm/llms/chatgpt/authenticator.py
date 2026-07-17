@@ -3,6 +3,7 @@ import json
 import os
 import time
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any, Final
 
 import httpx
@@ -42,6 +43,11 @@ def get_chatgpt_auth_file(
     if isinstance(value, str) and value:
         return value
     return None
+
+
+@lru_cache(maxsize=128)
+def get_cached_authenticator(auth_file: str) -> "Authenticator":
+    return Authenticator(auth_file=auth_file)
 
 
 class Authenticator:
