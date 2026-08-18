@@ -16,7 +16,7 @@ import { fetchUserModels } from "@/components/organisms/create_key_button";
 import { getModelDisplayName } from "@/components/key_team_helpers/fetch_available_models_team_key";
 import { tagInfoCall, tagUpdateCall } from "@/components/networking";
 import { Tag } from "@/components/tag_management/types";
-import NotificationsManager from "@/components/molecules/notifications_manager";
+import { toast } from "@/lib/toast";
 import NumericalInput from "@/components/shared/numerical_input";
 import BudgetDurationDropdown from "@/components/common_components/budget_duration_dropdown";
 import { copyToClipboard as utilCopyToClipboard } from "@/utils/dataUtils";
@@ -67,7 +67,7 @@ const TagInfoView: React.FC<TagInfoViewProps> = ({ tagId, onClose, accessToken, 
       }
     } catch (error) {
       console.error("Error fetching tag details:", error);
-      NotificationsManager.fromBackend("Error fetching tag details: " + error);
+      toast.fromError("Error fetching tag details: " + error);
     }
   };
 
@@ -95,12 +95,12 @@ const TagInfoView: React.FC<TagInfoViewProps> = ({ tagId, onClose, accessToken, 
         rpm_limit: values.rpm_limit,
         budget_duration: values.budget_duration,
       });
-      NotificationsManager.success("Tag updated successfully");
+      toast.success("Tag updated successfully");
       setIsEditing(false);
       fetchTagDetails();
     } catch (error) {
       console.error("Error updating tag:", error);
-      NotificationsManager.fromBackend("Error updating tag: " + error);
+      toast.fromError("Error updating tag: " + error);
     }
   };
 

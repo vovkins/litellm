@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Modal, Form, Input, Select } from "antd";
-import MessageManager from "@/components/molecules/message_manager";
+import { toast } from "@/lib/toast";
 import { Button } from "@tremor/react";
 import { registerClaudeCodePlugin } from "@/components/networking";
 import {
@@ -105,39 +105,39 @@ const AddPluginForm: React.FC<AddPluginFormProps> = ({ visible, onClose, accessT
 
   const handleSubmit = async (values: AddPluginFormValues) => {
     if (!accessToken) {
-      MessageManager.error("No access token available");
+      toast.error("No access token available");
       return;
     }
 
     if (!urlPreview) {
-      MessageManager.error("Please enter a valid repository URL");
+      toast.error("Please enter a valid repository URL");
       return;
     }
 
     if (!validatePluginName(values.name)) {
-      MessageManager.error("Skill name must be kebab-case (lowercase letters, numbers, and hyphens only)");
+      toast.error("Skill name must be kebab-case (lowercase letters, numbers, and hyphens only)");
       return;
     }
 
     if (values.version && !isValidSemanticVersion(values.version)) {
-      MessageManager.error("Version must be in semantic versioning format (e.g., 1.0.0)");
+      toast.error("Version must be in semantic versioning format (e.g., 1.0.0)");
       return;
     }
 
     if (values.authorEmail && !isValidEmail(values.authorEmail)) {
-      MessageManager.error("Invalid email format");
+      toast.error("Invalid email format");
       return;
     }
 
     if (values.homepage && !isValidUrl(values.homepage)) {
-      MessageManager.error("Invalid homepage URL format");
+      toast.error("Invalid homepage URL format");
       return;
     }
 
     setIsSubmitting(true);
     try {
       await registerClaudeCodePlugin(accessToken, buildRegisterRequest(values, urlPreview.parsed));
-      MessageManager.success("Skill registered successfully");
+      toast.success("Skill registered successfully");
       form.resetFields();
       setUrlPreview(null);
       setUrlEncodesSubdir(false);
@@ -145,7 +145,7 @@ const AddPluginForm: React.FC<AddPluginFormProps> = ({ visible, onClose, accessT
       onClose();
     } catch (error) {
       console.error("Error registering skill:", error);
-      MessageManager.error(error instanceof Error && error.message ? error.message : "Failed to register skill");
+      toast.error(error instanceof Error && error.message ? error.message : "Failed to register skill");
     } finally {
       setIsSubmitting(false);
     }

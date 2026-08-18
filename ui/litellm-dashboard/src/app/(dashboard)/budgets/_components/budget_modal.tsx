@@ -2,7 +2,7 @@ import React from "react";
 import { TextInput, Accordion, AccordionHeader, AccordionBody } from "@tremor/react";
 import { Button as Button2, Modal, Form, InputNumber, Select } from "antd";
 import { useCreateBudget } from "@/app/(dashboard)/hooks/budgets/useBudgets";
-import NotificationsManager from "@/components/molecules/notifications_manager";
+import { toast } from "@/lib/toast";
 
 interface BudgetModalProps {
   isModalVisible: boolean;
@@ -24,14 +24,14 @@ const BudgetModal: React.FC<BudgetModalProps> = ({ isModalVisible, setIsModalVis
 
   const handleCreate = async (formValues: Record<string, any>) => {
     try {
-      NotificationsManager.info("Making API Call");
+      toast.info("Making API Call");
       await createBudget.mutateAsync(formValues);
-      NotificationsManager.success("Budget Created");
+      toast.success("Budget Created");
       form.resetFields();
       setIsModalVisible(false);
     } catch (error) {
       console.error("Error creating the budget:", error);
-      NotificationsManager.fromBackend(`Error creating the budget: ${error}`);
+      toast.fromError(`Error creating the budget: ${error}`);
     }
   };
 

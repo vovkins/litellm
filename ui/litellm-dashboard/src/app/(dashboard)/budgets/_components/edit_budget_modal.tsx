@@ -3,7 +3,7 @@ import { TextInput, Accordion, AccordionHeader, AccordionBody } from "@tremor/re
 import { Button as Button2, Modal, Form, InputNumber, Select } from "antd";
 import { useUpdateBudget } from "@/app/(dashboard)/hooks/budgets/useBudgets";
 import { budgetItem } from "@/app/(dashboard)/hooks/budgets/useBudgets";
-import NotificationsManager from "@/components/molecules/notifications_manager";
+import { toast } from "@/lib/toast";
 
 interface EditBudgetModalProps {
   isModalVisible: boolean;
@@ -30,14 +30,14 @@ const EditBudgetModal: React.FC<EditBudgetModalProps> = ({ isModalVisible, setIs
 
   const handleUpdate = async (formValues: Record<string, any>) => {
     try {
-      NotificationsManager.info("Making API Call");
+      toast.info("Making API Call");
       await updateBudget.mutateAsync(formValues);
-      NotificationsManager.success("Budget Updated");
+      toast.success("Budget Updated");
       form.resetFields();
       setIsModalVisible(false);
     } catch (error) {
       console.error("Error updating the budget:", error);
-      NotificationsManager.fromBackend(`Error updating the budget: ${error}`);
+      toast.fromError(`Error updating the budget: ${error}`);
     }
   };
 
