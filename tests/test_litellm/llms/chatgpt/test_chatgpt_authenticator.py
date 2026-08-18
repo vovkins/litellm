@@ -60,9 +60,7 @@ class TestChatGPTAuthenticator:
             assert token == "token-new"
 
     def test_get_account_id_from_id_token(self, authenticator):
-        id_token = _make_jwt(
-            {"https://api.openai.com/auth": {"chatgpt_account_id": "acct-123"}}
-        )
+        id_token = _make_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-123"}})
         auth_data = json.dumps({"id_token": id_token})
 
         with (
@@ -107,6 +105,22 @@ class TestChatGPTMultiAccountAuthenticator:
 
         assert authenticator.auth_file == str(tmp_path / "env-dir" / "env.json")
 
+    def test_relative_auth_file_uses_absolute_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        authenticator = Authenticator(auth_file="account-a/auth.json")
+
+        assert authenticator.auth_file == str(tmp_path / "account-a" / "auth.json")
+        assert authenticator.token_dir == str(tmp_path / "account-a")
+        assert (tmp_path / "account-a").is_dir()
+
+    def test_auth_file_expands_home_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        authenticator = Authenticator(auth_file="~/.config/litellm/account-a.json")
+
+        assert authenticator.auth_file == str(tmp_path / ".config" / "litellm" / "account-a.json")
+
     def test_two_auth_files_are_isolated(self, tmp_path):
         file_a = tmp_path / "account-a.json"
         file_b = tmp_path / "account-b.json"
@@ -129,6 +143,14 @@ class TestChatGPTMultiAccountAuthenticator:
 
         assert get_cached_authenticator(str(file_a)) is authenticator_a
         assert get_cached_authenticator(str(file_b)) is not authenticator_a
+
+    def test_get_cached_authenticator_reuses_instance_for_equivalent_paths(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        absolute_path = tmp_path / "account-a" / "auth.json"
+
+        authenticator = get_cached_authenticator("account-a/auth.json")
+
+        assert get_cached_authenticator(str(absolute_path)) is authenticator
 
     def test_get_chatgpt_auth_file(self):
         assert get_chatgpt_auth_file(None) is None

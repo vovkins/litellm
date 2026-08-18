@@ -39,7 +39,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         return LlmProviders.CHATGPT
 
     def _resolve_authenticator(self, litellm_params: GenericLiteLLMParams | None) -> Authenticator:
-        auth_file = get_chatgpt_auth_file(litellm_params)
+        auth_file: Final = get_chatgpt_auth_file(litellm_params)
         if auth_file:
             return get_cached_authenticator(auth_file)
         return self.authenticator

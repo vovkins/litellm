@@ -1,13 +1,16 @@
 from collections.abc import Mapping
 from typing import Any, Final
 
-from pydantic import BaseModel
-
 from litellm.exceptions import AuthenticationError
 from litellm.llms.openai.openai import OpenAIConfig
 from litellm.types.llms.openai import AllMessageValues
 
-from ..authenticator import Authenticator, get_cached_authenticator, get_chatgpt_auth_file
+from ..authenticator import (
+    Authenticator,
+    ChatGPTAuthFileParams,
+    get_cached_authenticator,
+    get_chatgpt_auth_file,
+)
 from ..common_utils import (
     GetAccessTokenError,
     ensure_chatgpt_session_id,
@@ -26,7 +29,9 @@ class ChatGPTConfig(OpenAIConfig):
         super().__init__()
         self.authenticator = Authenticator()
 
-    def _resolve_authenticator(self, litellm_params: Mapping[str, object] | BaseModel | None) -> Authenticator:
+    def _resolve_authenticator(
+        self, litellm_params: Mapping[str, object] | ChatGPTAuthFileParams | None
+    ) -> Authenticator:
         auth_file: Final = get_chatgpt_auth_file(litellm_params)
         if auth_file:
             return get_cached_authenticator(auth_file)
@@ -49,7 +54,7 @@ class ChatGPTConfig(OpenAIConfig):
         api_base: str | None,
         api_key: str | None,
         custom_llm_provider: str,
-        litellm_params: Mapping[str, object] | BaseModel | None = None,
+        litellm_params: Mapping[str, object] | ChatGPTAuthFileParams | None = None,
     ) -> tuple[str | None, str | None, str]:
         authenticator: Final = self._resolve_authenticator(litellm_params)
         dynamic_api_base: Final = authenticator.get_api_base()

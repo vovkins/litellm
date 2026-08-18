@@ -4,10 +4,9 @@ import os
 import time
 from collections.abc import Mapping
 from functools import lru_cache
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import httpx
-from pydantic import BaseModel
 
 from litellm._logging import verbose_logger
 from litellm.llms.custom_httpx.http_handler import _get_httpx_client
@@ -31,32 +30,45 @@ DEVICE_CODE_COOLDOWN_SECONDS: Final = 5 * 60
 DEVICE_CODE_POLL_SLEEP_SECONDS: Final = 5
 
 
+class ChatGPTAuthFileParams(Protocol):
+    chatgpt_auth_file: str | None
+
+
 def get_chatgpt_auth_file(
-    litellm_params: Mapping[str, object] | BaseModel | None,
+    litellm_params: Mapping[str, object] | ChatGPTAuthFileParams | None,
 ) -> str | None:
     if litellm_params is None:
         return None
-    if isinstance(litellm_params, Mapping):
-        value = litellm_params.get("chatgpt_auth_file")
-    else:
-        value = getattr(litellm_params, "chatgpt_auth_file", None)
+    value: Final = (
+        litellm_params.get("chatgpt_auth_file")
+        if isinstance(litellm_params, Mapping)
+        else litellm_params.chatgpt_auth_file
+    )
     if isinstance(value, str) and value:
         return value
     return None
 
 
+def normalize_chatgpt_auth_file(auth_file: str) -> str:
+    return os.path.abspath(os.path.expanduser(auth_file))
+
+
 @lru_cache(maxsize=128)
-def get_cached_authenticator(auth_file: str) -> "Authenticator":
+def _get_cached_authenticator(auth_file: str) -> "Authenticator":
     return Authenticator(auth_file=auth_file)
+
+
+def get_cached_authenticator(auth_file: str) -> "Authenticator":
+    return _get_cached_authenticator(normalize_chatgpt_auth_file(auth_file))
 
 
 class Authenticator:
     def __init__(self, auth_file: str | None = None) -> None:
-        default_auth_file = os.path.join(
+        default_auth_file: Final = os.path.join(
             os.getenv("CHATGPT_TOKEN_DIR", os.path.expanduser("~/.config/litellm/chatgpt")),
             os.getenv("CHATGPT_AUTH_FILE", "auth.json"),
         )
-        self.auth_file = os.path.expanduser(auth_file or default_auth_file)
+        self.auth_file = normalize_chatgpt_auth_file(auth_file or default_auth_file)
         self.token_dir = os.path.dirname(self.auth_file)
         self._ensure_token_dir()
 
