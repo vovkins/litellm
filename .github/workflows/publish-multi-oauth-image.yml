@@ -1,0 +1,206 @@
+name: Publish Multi-OAuth Image
+
+on:
+  push:
+    tags:
+      - "v1.97.0-multi-oauth.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Immutable image version, for example 1.97.0-multi-oauth.1"
+        required: true
+        default: "1.97.0-multi-oauth.1"
+        type: string
+      commit_sha:
+        description: "Full 40-character commit SHA to build"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-multi-oauth-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/litellm
+  UPSTREAM_VERSION: "1.97.0"
+  UPSTREAM_SHA: ef84494d52c6708e4e9f4a54ce551a265995ad8f
+
+jobs:
+  publish:
+    name: Build, verify, and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.commit_sha || github.sha }}
+
+      - name: Validate release inputs
+        id: release
+        env:
+          DISPATCH_COMMIT_SHA: ${{ inputs.commit_sha }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            commit_sha="${DISPATCH_COMMIT_SHA}"
+            version="${DISPATCH_VERSION}"
+          else
+            commit_sha="$(git rev-parse HEAD)"
+            version="${REF_NAME#v}"
+          fi
+
+          if [[ ! "${commit_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::commit_sha must be a full lowercase 40-character SHA"
+            exit 1
+          fi
+          if [[ ! "${version}" =~ ^1\.97\.0-multi-oauth\.[1-9][0-9]*$ ]]; then
+            echo "::error::version must match 1.97.0-multi-oauth.N"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "${commit_sha}" ]]; then
+            echo "::error::checked-out commit does not match commit_sha"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${UPSTREAM_SHA}" "${commit_sha}"; then
+            echo "::error::commit is not based on the pinned LiteLLM upstream SHA"
+            exit 1
+          fi
+
+          project_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [[ "${project_version}" != "${UPSTREAM_VERSION}" ]]; then
+            echo "::error::pyproject.toml version ${project_version} does not match ${UPSTREAM_VERSION}"
+            exit 1
+          fi
+
+          echo "commit_sha=${commit_sha}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${commit_sha:0:12}" >> "${GITHUB_OUTPUT}"
+          echo "image=${REGISTRY}/${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse existing immutable tags
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          SHORT_SHA: ${{ steps.release.outputs.short_sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in "${VERSION}" "sha-${SHORT_SHA}"; do
+            if docker buildx imagetools inspect "${IMAGE}:${tag}" >/dev/null 2>&1; then
+              echo "::error::immutable image tag already exists: ${IMAGE}:${tag}"
+              exit 1
+            fi
+          done
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.release.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.release.outputs.version }}
+            type=raw,value=sha-${{ steps.release.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.title=LiteLLM Multi-OAuth
+            org.opencontainers.image.description=LiteLLM ${{ env.UPSTREAM_VERSION }} with per-model ChatGPT OAuth profiles
+            org.opencontainers.image.revision=${{ steps.release.outputs.commit_sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+
+      - name: Build smoke-test image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: linux/amd64
+          push: false
+          tags: litellm-multi-oauth-smoke:${{ steps.release.outputs.short_sha }}
+          cache-from: type=gha,scope=multi-oauth-${{ env.UPSTREAM_VERSION }}
+          cache-to: type=gha,mode=max,scope=multi-oauth-${{ env.UPSTREAM_VERSION }}
+
+      - name: Verify the built image
+        env:
+          SHORT_SHA: ${{ steps.release.outputs.short_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint python \
+            "litellm-multi-oauth-smoke:${SHORT_SHA}" \
+            -c "from litellm.llms.chatgpt.authenticator import get_cached_authenticator; from litellm.types.router import GenericLiteLLMParams; p = GenericLiteLLMParams(chatgpt_auth_file='/tmp/account/auth.json'); assert p.chatgpt_auth_file == '/tmp/account/auth.json'; assert get_cached_authenticator('/tmp/account/auth.json') is get_cached_authenticator('/tmp/account/./auth.json')"
+
+      - name: Build and publish multi-platform image
+        id: publish
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          labels: ${{ steps.metadata.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          push: true
+          sbom: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          cache-from: type=gha,scope=multi-oauth-${{ env.UPSTREAM_VERSION }}
+          cache-to: type=gha,mode=max,scope=multi-oauth-${{ env.UPSTREAM_VERSION }}
+
+      - name: Attest the published image
+        uses: actions/attest-build-provenance@8beda2b7ed98355c0e97c0a63bec38ae472e66c4 # v4
+        with:
+          subject-name: ${{ steps.release.outputs.image }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify published platforms and digest
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}")"
+          grep -q "Platform:.*linux/amd64" <<< "${manifest}"
+          grep -q "Platform:.*linux/arm64" <<< "${manifest}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null
+
+          {
+            echo "## Published LiteLLM Multi-OAuth image"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Commit: \`${{ steps.release.outputs.commit_sha }}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Deployment reference: \`${IMAGE}@${DIGEST}\`"
+            echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
