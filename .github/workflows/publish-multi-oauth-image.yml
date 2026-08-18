@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Immutable image version, for example 1.97.0-multi-oauth.2"
+        description: "Immutable image version, for example 1.97.0-multi-oauth.3"
         required: true
-        default: "1.97.0-multi-oauth.2"
+        default: "1.97.0-multi-oauth.3"
         type: string
       commit_sha:
         description: "Full 40-character commit SHA to build"
@@ -192,7 +192,7 @@ jobs:
           docker run --rm \
             --entrypoint python \
             "litellm-multi-oauth-smoke:${SHORT_SHA}-${ARTIFACT}" \
-            -c "from litellm.llms.chatgpt.authenticator import get_cached_authenticator; from litellm.types.router import GenericLiteLLMParams; p = GenericLiteLLMParams(chatgpt_auth_file='/tmp/account/auth.json'); assert p.chatgpt_auth_file == '/tmp/account/auth.json'; assert get_cached_authenticator('/tmp/account/auth.json') is get_cached_authenticator('/tmp/account/./auth.json')"
+            -c "import json, os, stat, tempfile; from litellm.llms.chatgpt.authenticator import Authenticator, get_cached_authenticator; from litellm.types.router import GenericLiteLLMParams; root = tempfile.mkdtemp(); path = os.path.join(root, 'account', 'auth.json'); p = GenericLiteLLMParams(chatgpt_auth_file=path); assert p.chatgpt_auth_file == path; a = get_cached_authenticator(path); assert a is get_cached_authenticator(os.path.join(root, 'account', '.', 'auth.json')); payload = {'access_token': 'smoke-token', 'account_id': 'smoke-account', 'expires_at': 4102444800}; assert a._write_auth_file(payload); assert stat.S_IMODE(os.stat(path).st_mode) == 0o600; assert json.load(open(path, encoding='utf-8')) == payload; assert a.get_access_token() == 'smoke-token'"
 
       - name: Build and publish image by digest
         id: publish

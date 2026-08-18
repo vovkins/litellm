@@ -1,8 +1,12 @@
 import base64
 import json
+import os
+import stat
+import threading
 import time
-from unittest.mock import mock_open, patch
+from unittest.mock import patch
 
+import httpx
 import pytest
 
 from litellm.llms.chatgpt.authenticator import (
@@ -25,55 +29,55 @@ def _make_jwt(payload: dict) -> str:
 
 class TestChatGPTAuthenticator:
     @pytest.fixture
-    def authenticator(self):
-        with patch("os.path.exists", return_value=True):
-            return Authenticator()
+    def authenticator(self, tmp_path):
+        return Authenticator(auth_file=str(tmp_path / "auth.json"))
 
     def test_get_access_token_from_file(self, authenticator):
         future_time = time.time() + 3600
-        auth_data = json.dumps({"access_token": "token-123", "expires_at": future_time})
+        with open(authenticator.auth_file, "w") as auth_file:
+            json.dump({"access_token": "token-123", "expires_at": future_time}, auth_file)
 
-        with patch("builtins.open", mock_open(read_data=auth_data)):
-            token = authenticator.get_access_token()
-            assert token == "token-123"
+        token = authenticator.get_access_token()
+
+        assert token == "token-123"
 
     def test_get_access_token_refresh(self, authenticator):
         past_time = time.time() - 10
-        auth_data = json.dumps(
-            {
-                "access_token": "token-old",
-                "refresh_token": "refresh-123",
-                "expires_at": past_time,
-            }
-        )
+        with open(authenticator.auth_file, "w") as auth_file:
+            json.dump(
+                {
+                    "access_token": "token-old",
+                    "refresh_token": "refresh-123",
+                    "expires_at": past_time,
+                },
+                auth_file,
+            )
         refreshed = {
             "access_token": "token-new",
             "refresh_token": "refresh-123",
             "id_token": "id-123",
         }
 
-        with (
-            patch("builtins.open", mock_open(read_data=auth_data)),
-            patch.object(authenticator, "_refresh_tokens", return_value=refreshed),
-        ):
+        with patch.object(authenticator, "_refresh_tokens", return_value=refreshed):
             token = authenticator.get_access_token()
-            assert token == "token-new"
+
+        assert token == "token-new"
 
     def test_get_account_id_from_id_token(self, authenticator):
         id_token = _make_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-123"}})
-        auth_data = json.dumps({"id_token": id_token})
+        with open(authenticator.auth_file, "w") as auth_file:
+            json.dump({"id_token": id_token}, auth_file)
 
-        with (
-            patch("builtins.open", mock_open(read_data=auth_data)),
-            patch.object(authenticator, "_write_auth_file") as mock_write,
-        ):
+        with patch.object(authenticator, "_write_auth_file") as mock_write:
             account_id = authenticator.get_account_id()
-            assert account_id == "acct-123"
-            mock_write.assert_called_once()
-            assert mock_write.call_args[0][0]["account_id"] == "acct-123"
+
+        assert account_id == "acct-123"
+        mock_write.assert_called_once()
+        assert mock_write.call_args[0][0]["account_id"] == "acct-123"
 
 
 def _write_auth_record(path, token: str, account_id: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
@@ -159,3 +163,112 @@ class TestChatGPTMultiAccountAuthenticator:
         assert get_chatgpt_auth_file({"chatgpt_auth_file": "/a/auth.json"}) == "/a/auth.json"
         assert get_chatgpt_auth_file(GenericLiteLLMParams()) is None
         assert get_chatgpt_auth_file(GenericLiteLLMParams(chatgpt_auth_file="/b/auth.json")) == "/b/auth.json"
+
+    def test_atomic_write_uses_private_mode_and_complete_json(self, tmp_path):
+        auth_file = tmp_path / "account-a" / "auth.json"
+        authenticator = Authenticator(auth_file=str(auth_file))
+        auth_data = {
+            "access_token": "new-token",
+            "account_id": "acct-a",
+            "expires_at": time.time() + 3600,
+        }
+
+        authenticator._write_auth_file(auth_data)
+
+        assert json.loads(auth_file.read_text()) == auth_data
+        assert stat.S_IMODE(auth_file.stat().st_mode) == 0o600
+        assert not list(auth_file.parent.glob(".auth.json.*"))
+
+    def test_failed_atomic_write_preserves_existing_file(self, tmp_path):
+        auth_file = tmp_path / "account-a" / "auth.json"
+        authenticator = Authenticator(auth_file=str(auth_file))
+        old_data = {"access_token": "old-token", "expires_at": time.time() + 3600}
+        authenticator._write_auth_file(old_data)
+
+        with patch("os.replace", side_effect=OSError("synthetic failure")):
+            write_result = authenticator._write_auth_file({"access_token": "new-token"})
+
+        assert write_result is None
+        assert json.loads(auth_file.read_text()) == old_data
+        assert not list(auth_file.parent.glob(".auth.json.*"))
+
+    def test_cached_authenticator_observes_atomic_replacement(self, tmp_path):
+        auth_file = tmp_path / "account-a" / "auth.json"
+        _write_auth_record(auth_file, "token-old", "acct-a")
+        authenticator = get_cached_authenticator(str(auth_file))
+        assert authenticator.get_access_token() == "token-old"
+
+        replacement = auth_file.parent / "auth.json.next"
+        _write_auth_record(replacement, "token-new", "acct-a")
+        os.replace(replacement, auth_file)
+
+        assert authenticator.get_access_token() == "token-new"
+
+    def test_refresh_does_not_overwrite_imported_replacement(self, tmp_path):
+        auth_file = tmp_path / "account-a" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(
+            json.dumps(
+                {
+                    "access_token": "token-old",
+                    "refresh_token": "refresh-old",
+                    "account_id": "acct-a",
+                    "expires_at": time.time() - 10,
+                }
+            )
+        )
+        authenticator = Authenticator(auth_file=str(auth_file))
+
+        def refresh_and_replace(url, **kwargs):
+            replacement = auth_file.parent / "auth.json.next"
+            _write_auth_record(replacement, "token-imported", "acct-a")
+            os.replace(replacement, auth_file)
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "token-refreshed-from-old-session",
+                    "refresh_token": "refresh-old",
+                    "id_token": "id-old",
+                },
+                request=httpx.Request("POST", url),
+            )
+
+        with patch("litellm.llms.chatgpt.authenticator._get_httpx_client") as get_client:
+            get_client.return_value.post.side_effect = refresh_and_replace
+            access_token = authenticator.get_access_token()
+
+        assert access_token == "token-imported"
+        assert json.loads(auth_file.read_text())["access_token"] == "token-imported"
+        assert not list(auth_file.parent.glob(".auth.json.*"))
+
+    @pytest.mark.skipif(os.name != "posix", reason="requires POSIX flock")
+    def test_read_waits_for_exclusive_import_lock(self, tmp_path):
+        import fcntl
+
+        auth_file = tmp_path / "account-a" / "auth.json"
+        _write_auth_record(auth_file, "token-a", "acct-a")
+        authenticator = Authenticator(auth_file=str(auth_file))
+        lock_file = auth_file.parent / ".import.lock"
+        lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        started = threading.Event()
+        finished = threading.Event()
+        result = []
+
+        def read_auth_file():
+            started.set()
+            result.append(authenticator._read_auth_file())
+            finished.set()
+
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            thread = threading.Thread(target=read_auth_file)
+            thread.start()
+            assert started.wait(timeout=1)
+            assert not finished.wait(timeout=0.1)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            thread.join(timeout=1)
+        finally:
+            os.close(lock_fd)
+
+        assert finished.is_set()
+        assert result[0]["access_token"] == "token-a"

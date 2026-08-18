@@ -1,12 +1,19 @@
 import base64
 import json
 import os
+import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any, Final, Protocol
 
 import httpx
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows keeps atomic writes without flock.
+    fcntl = None  # type: ignore[assignment]
 
 from litellm._logging import verbose_logger
 from litellm.llms.custom_httpx.http_handler import _get_httpx_client
@@ -28,6 +35,31 @@ TOKEN_EXPIRY_SKEW_SECONDS: Final = 60
 DEVICE_CODE_TIMEOUT_SECONDS: Final = 15 * 60
 DEVICE_CODE_COOLDOWN_SECONDS: Final = 5 * 60
 DEVICE_CODE_POLL_SLEEP_SECONDS: Final = 5
+
+
+@contextmanager
+def _auth_file_lock(token_dir: str, *, exclusive: bool) -> Iterator[None]:
+    lock_path: Final = os.path.join(token_dir, ".import.lock")
+    flags: Final = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    lock_fd: Final = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(lock_fd, 0o600)
+        if fcntl is not None:
+            operation: Final = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(lock_fd, operation)
+        yield
+    finally:
+        os.close(lock_fd)
+
+
+def _fsync_directory(path: str) -> None:
+    if os.name != "posix":
+        return
+    directory_fd: Final = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 class ChatGPTAuthFileParams(Protocol):
@@ -84,7 +116,10 @@ class Authenticator:
             refresh_token: Final = auth_data.get("refresh_token")
             if refresh_token:
                 try:
-                    refreshed: Final = self._refresh_tokens(refresh_token)
+                    refreshed: Final = self._refresh_tokens(
+                        refresh_token,
+                        expected_auth_data=auth_data,
+                    )
                     return refreshed["access_token"]
                 except RefreshAccessTokenError as exc:
                     verbose_logger.warning("ChatGPT refresh token failed, re-login required: %s", exc)
@@ -119,20 +154,59 @@ class Authenticator:
 
     def _read_auth_file(self) -> dict[str, Any] | None:
         try:
-            with open(self.auth_file, "r") as f:
-                return json.load(f)
+            with _auth_file_lock(self.token_dir, exclusive=False):
+                with open(self.auth_file, "r") as f:
+                    return json.load(f)
         except OSError:
             return None
         except json.JSONDecodeError as exc:
             verbose_logger.warning("Invalid ChatGPT auth file: %s", exc)
             return None
 
-    def _write_auth_file(self, data: dict[str, Any]) -> None:
+    def _write_auth_file(
+        self,
+        data: dict[str, Any],
+        *,
+        expected_auth_data: dict[str, Any] | None = None,
+    ) -> bool | None:
+        temp_path: str | None = None
         try:
-            with open(self.auth_file, "w") as f:
-                json.dump(data, f)
+            with _auth_file_lock(self.token_dir, exclusive=True):
+                if expected_auth_data is not None:
+                    try:
+                        with open(self.auth_file, "r", encoding="utf-8") as current_file:
+                            current_auth_data = json.load(current_file)
+                    except (OSError, json.JSONDecodeError):
+                        current_auth_data = None
+                    if current_auth_data != expected_auth_data:
+                        verbose_logger.info(
+                            "ChatGPT auth file changed while tokens were refreshed; preserving the newer session"
+                        )
+                        return False
+                temp_fd, temp_path = tempfile.mkstemp(
+                    prefix=".auth.json.",
+                    dir=self.token_dir,
+                )
+                with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+                    os.fchmod(f.fileno(), 0o600)
+                    json.dump(data, f)
+                    f.write("\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, self.auth_file)
+                temp_path = None
+                os.chmod(self.auth_file, 0o600)
+                _fsync_directory(self.token_dir)
+                return True
         except OSError as exc:
             verbose_logger.error("Failed to write ChatGPT auth file: %s", exc)
+            return None
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
 
     def _is_token_expired(self, auth_data: dict[str, Any], access_token: str) -> bool:
         expires_at = auth_data.get("expires_at")
@@ -320,7 +394,12 @@ class Authenticator:
             "id_token": data["id_token"],
         }
 
-    def _refresh_tokens(self, refresh_token: str) -> dict[str, str]:
+    def _refresh_tokens(
+        self,
+        refresh_token: str,
+        *,
+        expected_auth_data: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
         try:
             client: Final = _get_httpx_client()
             resp: Final = client.post(
@@ -359,7 +438,23 @@ class Authenticator:
             "id_token": id_token,
         }
         auth_data: Final = self._build_auth_record(refreshed)
-        self._write_auth_file(auth_data)
+        write_result: Final = self._write_auth_file(
+            auth_data,
+            expected_auth_data=expected_auth_data,
+        )
+        if write_result is False:
+            current_auth_data: Final = self._read_auth_file()
+            current_access_token = current_auth_data.get("access_token") if current_auth_data else None
+            if isinstance(current_access_token, str) and current_access_token:
+                return {
+                    "access_token": current_access_token,
+                    "refresh_token": str(current_auth_data.get("refresh_token") or ""),
+                    "id_token": str(current_auth_data.get("id_token") or ""),
+                }
+            raise RefreshAccessTokenError(
+                message="ChatGPT auth file changed during token refresh",
+                status_code=409,
+            )
         return refreshed
 
     def _build_auth_record(self, tokens: dict[str, str]) -> dict[str, Any]:
