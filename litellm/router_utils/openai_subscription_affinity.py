@@ -1,14 +1,16 @@
-"""Redis-backed affinity between a LiteLLM virtual key and an OpenAI OAuth profile.
+"""Redis-backed affinity and availability for OpenAI OAuth profiles.
 
-This module only owns persistence. Selection, failover, and TTL refresh policy are
-implemented by the routing layer that consumes this store.
+This module only owns persistence and atomic state transitions. Error
+classification, failover, and routing policy are implemented by consumers.
 """
 
 from __future__ import annotations
 
 import re
+import secrets
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Final, Protocol, cast
 
 from litellm.caching.dual_cache import DualCache
@@ -67,8 +69,231 @@ redis.call('SET', KEYS[1], selected_profile, 'EX', ttl)
 return {'assigned', selected_profile, tostring(ttl)}
 """
 
+_PROFILE_STATE_SCRIPT: Final = """
+local operation = ARGV[1]
+
+local function is_positive_integer(value, maximum)
+  if value == false or value == nil or string.match(value, '^%d+$') == nil then
+    return false
+  end
+  local parsed = tonumber(value)
+  return parsed ~= nil and parsed > 0 and parsed <= maximum
+end
+
+local function is_reason_code(value)
+  return value ~= false
+    and value ~= nil
+    and string.len(value) <= 64
+    and string.match(value, '^[a-z][a-z0-9_]*$') ~= nil
+end
+
+local function is_lease_token(value)
+  return value ~= false
+    and value ~= nil
+    and string.len(value) == 32
+    and string.match(value, '^[0-9a-f]+$') ~= nil
+end
+
+local function validate_record()
+  local state = redis.call('HGET', KEYS[1], 'state')
+  if state == false then
+    if redis.call('EXISTS', KEYS[1]) == 0 then
+      return 'missing'
+    end
+    return 'invalid'
+  end
+
+  local reset_at = redis.call('HGET', KEYS[1], 'reset_at')
+  local lease_token = redis.call('HGET', KEYS[1], 'lease_token')
+  local lease_until = redis.call('HGET', KEYS[1], 'lease_until')
+  local reason = redis.call('HGET', KEYS[1], 'reason')
+  local updated_at = redis.call('HGET', KEYS[1], 'updated_at')
+  local field_count = redis.call('HLEN', KEYS[1])
+
+  if not is_positive_integer(updated_at, 253402300799) then
+    return 'invalid'
+  end
+  if state == 'available' then
+    if field_count ~= 2
+      or reset_at ~= false
+      or lease_token ~= false
+      or lease_until ~= false
+      or reason ~= false then
+      return 'invalid'
+    end
+  elseif state == 'cooldown' then
+    if field_count ~= 4
+      or not is_positive_integer(reset_at, 253402300799)
+      or lease_token ~= false
+      or lease_until ~= false
+      or not is_reason_code(reason) then
+      return 'invalid'
+    end
+  elseif state == 'half_open' then
+    if field_count ~= 6
+      or not is_positive_integer(reset_at, 253402300799)
+      or not is_lease_token(lease_token)
+      or not is_positive_integer(lease_until, 253402300799)
+      or not is_reason_code(reason) then
+      return 'invalid'
+    end
+  elseif state == 'disabled' then
+    if field_count ~= 3
+      or reset_at ~= false
+      or lease_token ~= false
+      or lease_until ~= false
+      or not is_reason_code(reason) then
+      return 'invalid'
+    end
+  else
+    return 'invalid'
+  end
+  return state
+end
+
+local function snapshot()
+  local state = redis.call('HGET', KEYS[1], 'state')
+  if state == false then
+    return {'missing'}
+  end
+  return {
+    'found',
+    state,
+    redis.call('HGET', KEYS[1], 'reset_at') or '',
+    redis.call('HGET', KEYS[1], 'lease_until') or '',
+    redis.call('HGET', KEYS[1], 'reason') or '',
+    redis.call('HGET', KEYS[1], 'updated_at') or ''
+  }
+end
+
+local status = validate_record()
+if status == 'invalid' then
+  return {'invalid'}
+end
+if operation == 'read' then
+  return snapshot()
+end
+
+local now = tonumber(redis.call('TIME')[1])
+
+if operation == 'mark_available' then
+  redis.call('HSET', KEYS[1], 'state', 'available', 'updated_at', tostring(now))
+  redis.call('HDEL', KEYS[1], 'reset_at', 'lease_token', 'lease_until', 'reason')
+  return {'updated'}
+end
+
+if operation == 'mark_cooldown' then
+  if not is_positive_integer(ARGV[2], 253402300799) or not is_reason_code(ARGV[3]) then
+    return redis.error_reply('invalid profile cooldown arguments')
+  end
+  redis.call(
+    'HSET', KEYS[1],
+    'state', 'cooldown',
+    'reset_at', ARGV[2],
+    'reason', ARGV[3],
+    'updated_at', tostring(now)
+  )
+  redis.call('HDEL', KEYS[1], 'lease_token', 'lease_until')
+  return {'updated'}
+end
+
+if operation == 'disable' then
+  if not is_reason_code(ARGV[2]) then
+    return redis.error_reply('invalid profile disabled arguments')
+  end
+  redis.call(
+    'HSET', KEYS[1],
+    'state', 'disabled',
+    'reason', ARGV[2],
+    'updated_at', tostring(now)
+  )
+  redis.call('HDEL', KEYS[1], 'reset_at', 'lease_token', 'lease_until')
+  return {'updated'}
+end
+
+if operation == 'acquire_half_open' then
+  if not is_lease_token(ARGV[2]) or not is_positive_integer(ARGV[3], 3600) then
+    return redis.error_reply('invalid profile half-open arguments')
+  end
+  if status == 'missing' or status == 'available' or status == 'disabled' then
+    return {'not_acquired', status == 'missing' and 'available' or status}
+  end
+  if status == 'cooldown' then
+    local reset_at = tonumber(redis.call('HGET', KEYS[1], 'reset_at'))
+    if reset_at > now then
+      return {'not_acquired', 'cooldown'}
+    end
+  elseif status == 'half_open' then
+    local lease_until = tonumber(redis.call('HGET', KEYS[1], 'lease_until'))
+    if lease_until > now then
+      return {'not_acquired', 'half_open'}
+    end
+  end
+
+  local lease_until = now + tonumber(ARGV[3])
+  redis.call(
+    'HSET', KEYS[1],
+    'state', 'half_open',
+    'lease_token', ARGV[2],
+    'lease_until', tostring(lease_until),
+    'updated_at', tostring(now)
+  )
+  return {'acquired', tostring(lease_until)}
+end
+
+if operation == 'complete_half_open' then
+  if not is_lease_token(ARGV[2]) then
+    return redis.error_reply('invalid profile half-open completion arguments')
+  end
+  if status ~= 'half_open' then
+    return {'stale'}
+  end
+  local current_token = redis.call('HGET', KEYS[1], 'lease_token')
+  local lease_until = tonumber(redis.call('HGET', KEYS[1], 'lease_until'))
+  if current_token ~= ARGV[2] or lease_until <= now then
+    return {'stale'}
+  end
+
+  local target = ARGV[3]
+  if target == 'available' then
+    redis.call('HSET', KEYS[1], 'state', target, 'updated_at', tostring(now))
+    redis.call('HDEL', KEYS[1], 'reset_at', 'lease_token', 'lease_until', 'reason')
+  elseif target == 'cooldown' then
+    if not is_positive_integer(ARGV[4], 253402300799) or not is_reason_code(ARGV[5]) then
+      return redis.error_reply('invalid profile cooldown completion arguments')
+    end
+    redis.call(
+      'HSET', KEYS[1],
+      'state', target,
+      'reset_at', ARGV[4],
+      'reason', ARGV[5],
+      'updated_at', tostring(now)
+    )
+    redis.call('HDEL', KEYS[1], 'lease_token', 'lease_until')
+  elseif target == 'disabled' then
+    if not is_reason_code(ARGV[5]) then
+      return redis.error_reply('invalid profile disabled completion arguments')
+    end
+    redis.call(
+      'HSET', KEYS[1],
+      'state', target,
+      'reason', ARGV[5],
+      'updated_at', tostring(now)
+    )
+    redis.call('HDEL', KEYS[1], 'reset_at', 'lease_token', 'lease_until')
+  else
+    return redis.error_reply('invalid profile half-open completion target')
+  end
+  return {'applied'}
+end
+
+return redis.error_reply('unsupported profile state operation')
+"""
+
 _SHA256_HEX_PATTERN: Final = re.compile(r"^[0-9a-fA-F]{64}$")
 _PROFILE_ID_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_PROFILE_REASON_PATTERN: Final = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_HALF_OPEN_LEASE_TOKEN_PATTERN: Final = re.compile(r"^[0-9a-f]{32}$")
 
 
 class _RedisScript(Protocol):
@@ -95,6 +320,32 @@ class _AffinitySnapshot:
     ttl_seconds: int
 
 
+class OpenAIProfileState(str, Enum):
+    """Persisted availability state for one server-side OAuth profile."""
+
+    AVAILABLE = "available"
+    COOLDOWN = "cooldown"
+    HALF_OPEN = "half_open"
+    DISABLED = "disabled"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIProfileStateSnapshot:
+    state: OpenAIProfileState
+    reset_at: int | None
+    lease_expires_at: int | None
+    reason_code: str | None
+    updated_at: int | None
+    persisted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIProfileHalfOpenLease:
+    profile_id: str
+    token: str = field(repr=False)
+    expires_at: int
+
+
 class OpenAISubscriptionAffinityStore:
     """Persist one global OpenAI OAuth profile binding per virtual-key hash.
 
@@ -106,7 +357,11 @@ class OpenAISubscriptionAffinityStore:
 
     CACHE_KEY_PREFIX: Final = "openai_subscription_affinity:{v1}"
     COUNTER_CACHE_KEY: Final = f"{CACHE_KEY_PREFIX}:counter"
+    PROFILE_STATE_CACHE_KEY_PREFIX: Final = f"{CACHE_KEY_PREFIX}:profile"
     DEFAULT_TTL_SECONDS: Final = 24 * 60 * 60
+    DEFAULT_HALF_OPEN_LEASE_SECONDS: Final = 30
+    MAX_HALF_OPEN_LEASE_SECONDS: Final = 60 * 60
+    MAX_TIMESTAMP: Final = 253402300799
 
     def __init__(self, cache: DualCache) -> None:
         self.cache = cache
@@ -115,6 +370,11 @@ class OpenAISubscriptionAffinityStore:
     def get_cache_key(cls, user_api_key_hash: str) -> str:
         normalized_hash: Final = cls._validate_user_api_key_hash(user_api_key_hash)
         return f"{cls.CACHE_KEY_PREFIX}:binding:{normalized_hash}"
+
+    @classmethod
+    def get_profile_state_cache_key(cls, profile_id: str) -> str:
+        validated_profile_id: Final = cls._validate_profile_id(profile_id)
+        return f"{cls.PROFILE_STATE_CACHE_KEY_PREFIX}:{validated_profile_id}"
 
     async def get_profile(self, user_api_key_hash: str) -> str | None:
         snapshot: Final = await self._read_snapshot(user_api_key_hash)
@@ -206,6 +466,140 @@ class OpenAISubscriptionAffinityStore:
             raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity has no valid expiry")
         return profile_id
 
+    async def get_profile_state(self, profile_id: str) -> OpenAIProfileStateSnapshot:
+        """Read one profile state; an unknown profile starts as available."""
+
+        cache_key: Final = self.get_profile_state_cache_key(profile_id)
+        response: Final = await self._execute(_PROFILE_STATE_SCRIPT, (cache_key,), ("read",))
+        return self._parse_profile_state_snapshot(response)
+
+    async def mark_profile_available(self, profile_id: str) -> None:
+        """Unconditionally mark a valid record available.
+
+        A half-open probe should normally use ``complete_profile_half_open`` so a
+        stale request cannot overwrite a newer state.
+        """
+
+        cache_key: Final = self.get_profile_state_cache_key(profile_id)
+        response: Final = await self._execute(
+            _PROFILE_STATE_SCRIPT,
+            (cache_key,),
+            ("mark_available",),
+        )
+        self._require_profile_state_update(response)
+
+    async def mark_profile_cooldown(
+        self,
+        profile_id: str,
+        reset_at: int,
+        reason_code: str,
+    ) -> None:
+        cache_key: Final = self.get_profile_state_cache_key(profile_id)
+        validated_reset_at: Final = self._validate_timestamp(reset_at, "reset_at")
+        validated_reason: Final = self._validate_reason_code(reason_code)
+        response: Final = await self._execute(
+            _PROFILE_STATE_SCRIPT,
+            (cache_key,),
+            ("mark_cooldown", str(validated_reset_at), validated_reason),
+        )
+        self._require_profile_state_update(response)
+
+    async def disable_profile(self, profile_id: str, reason_code: str) -> None:
+        cache_key: Final = self.get_profile_state_cache_key(profile_id)
+        validated_reason: Final = self._validate_reason_code(reason_code)
+        response: Final = await self._execute(
+            _PROFILE_STATE_SCRIPT,
+            (cache_key,),
+            ("disable", validated_reason),
+        )
+        self._require_profile_state_update(response)
+
+    async def acquire_profile_half_open_lease(
+        self,
+        profile_id: str,
+        lease_seconds: int = DEFAULT_HALF_OPEN_LEASE_SECONDS,
+    ) -> OpenAIProfileHalfOpenLease | None:
+        """Acquire the sole probe lease after cooldown or an abandoned probe."""
+
+        validated_profile_id: Final = self._validate_profile_id(profile_id)
+        cache_key: Final = self.get_profile_state_cache_key(validated_profile_id)
+        validated_lease_seconds: Final = self._validate_half_open_lease_seconds(lease_seconds)
+        lease_token: Final = secrets.token_hex(16)
+        response: Final = await self._execute(
+            _PROFILE_STATE_SCRIPT,
+            (cache_key,),
+            ("acquire_half_open", lease_token, str(validated_lease_seconds)),
+        )
+        if len(response) == 2 and response[0] == "not_acquired":
+            try:
+                OpenAIProfileState(response[1])
+            except ValueError as exc:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription profile lease returned invalid data"
+                ) from exc
+            return None
+        if len(response) != 2 or response[0] != "acquired":
+            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile lease returned invalid data")
+        try:
+            expires_at: Final = self._validate_timestamp(int(response[1]), "lease_expires_at")
+        except (TypeError, ValueError) as exc:
+            raise OpenAISubscriptionAffinityStoreError(
+                "OpenAI subscription profile lease returned invalid data"
+            ) from exc
+        return OpenAIProfileHalfOpenLease(
+            profile_id=validated_profile_id,
+            token=lease_token,
+            expires_at=expires_at,
+        )
+
+    async def complete_profile_half_open(
+        self,
+        profile_id: str,
+        lease_token: str,
+        target_state: OpenAIProfileState,
+        *,
+        reset_at: int | None = None,
+        reason_code: str | None = None,
+    ) -> bool:
+        """Apply a probe result only while the caller still owns its lease."""
+
+        cache_key: Final = self.get_profile_state_cache_key(profile_id)
+        validated_token: Final = self._validate_half_open_lease_token(lease_token)
+        if not isinstance(target_state, OpenAIProfileState) or target_state is OpenAIProfileState.HALF_OPEN:
+            raise ValueError("target_state must be available, cooldown or disabled")
+
+        validated_reset_at = ""
+        validated_reason = ""
+        if target_state is OpenAIProfileState.AVAILABLE:
+            if reset_at is not None or reason_code is not None:
+                raise ValueError("available target_state does not accept reset_at or reason_code")
+        elif target_state is OpenAIProfileState.COOLDOWN:
+            if reset_at is None or reason_code is None:
+                raise ValueError("cooldown target_state requires reset_at and reason_code")
+            validated_reset_at = str(self._validate_timestamp(reset_at, "reset_at"))
+            validated_reason = self._validate_reason_code(reason_code)
+        else:
+            if reset_at is not None or reason_code is None:
+                raise ValueError("disabled target_state requires reason_code without reset_at")
+            validated_reason = self._validate_reason_code(reason_code)
+
+        response: Final = await self._execute(
+            _PROFILE_STATE_SCRIPT,
+            (cache_key,),
+            (
+                "complete_half_open",
+                validated_token,
+                target_state.value,
+                validated_reset_at,
+                validated_reason,
+            ),
+        )
+        if response == ("applied",):
+            return True
+        if response == ("stale",):
+            return False
+        raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile completion returned invalid data")
+
     async def _read_snapshot(self, user_api_key_hash: str) -> _AffinitySnapshot | None:
         cache_key: Final = self.get_cache_key(user_api_key_hash)
         response: Final = await self._execute(_AFFINITY_STORE_SCRIPT, (cache_key,), ("read",))
@@ -222,6 +616,62 @@ class OpenAISubscriptionAffinityStore:
         if ttl_seconds < 0:
             raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity has no valid expiry")
         return _AffinitySnapshot(profile_id=profile_id, ttl_seconds=ttl_seconds)
+
+    @classmethod
+    def _parse_profile_state_snapshot(
+        cls,
+        response: tuple[str, ...],
+    ) -> OpenAIProfileStateSnapshot:
+        if response == ("missing",):
+            return OpenAIProfileStateSnapshot(
+                state=OpenAIProfileState.AVAILABLE,
+                reset_at=None,
+                lease_expires_at=None,
+                reason_code=None,
+                updated_at=None,
+                persisted=False,
+            )
+        if len(response) != 6 or response[0] != "found":
+            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile state returned invalid data")
+
+        try:
+            state: Final = OpenAIProfileState(response[1])
+            reset_at: Final = cls._parse_optional_timestamp(response[2], "reset_at")
+            lease_expires_at: Final = cls._parse_optional_timestamp(
+                response[3],
+                "lease_expires_at",
+            )
+            reason_code: Final = cls._validate_reason_code(response[4]) if response[4] else None
+            updated_at: Final = cls._validate_timestamp(int(response[5]), "updated_at")
+        except (TypeError, ValueError) as exc:
+            raise OpenAISubscriptionAffinityStoreError(
+                "OpenAI subscription profile state contains invalid data"
+            ) from exc
+
+        if state is OpenAIProfileState.AVAILABLE:
+            valid_shape = reset_at is None and lease_expires_at is None and reason_code is None
+        elif state is OpenAIProfileState.COOLDOWN:
+            valid_shape = reset_at is not None and lease_expires_at is None and reason_code is not None
+        elif state is OpenAIProfileState.HALF_OPEN:
+            valid_shape = reset_at is not None and lease_expires_at is not None and reason_code is not None
+        else:
+            valid_shape = reset_at is None and lease_expires_at is None and reason_code is not None
+        if not valid_shape:
+            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile state contains invalid data")
+
+        return OpenAIProfileStateSnapshot(
+            state=state,
+            reset_at=reset_at,
+            lease_expires_at=lease_expires_at,
+            reason_code=reason_code,
+            updated_at=updated_at,
+            persisted=True,
+        )
+
+    @staticmethod
+    def _require_profile_state_update(response: tuple[str, ...]) -> None:
+        if response != ("updated",):
+            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile state update returned invalid data")
 
     async def _execute(
         self,
@@ -273,6 +723,46 @@ class OpenAISubscriptionAffinityStore:
         if not isinstance(profile_id, str) or _PROFILE_ID_PATTERN.fullmatch(profile_id) is None:
             raise ValueError("profile_id has an invalid format")
         return profile_id
+
+    @classmethod
+    def _validate_timestamp(cls, timestamp: int, field_name: str) -> int:
+        if (
+            not isinstance(timestamp, int)
+            or isinstance(timestamp, bool)
+            or timestamp <= 0
+            or timestamp > cls.MAX_TIMESTAMP
+        ):
+            raise ValueError(f"{field_name} must be a valid positive Unix timestamp")
+        return timestamp
+
+    @classmethod
+    def _parse_optional_timestamp(cls, value: str, field_name: str) -> int | None:
+        if not value:
+            return None
+        return cls._validate_timestamp(int(value), field_name)
+
+    @staticmethod
+    def _validate_reason_code(reason_code: str) -> str:
+        if not isinstance(reason_code, str) or _PROFILE_REASON_PATTERN.fullmatch(reason_code) is None:
+            raise ValueError("reason_code has an invalid format")
+        return reason_code
+
+    @classmethod
+    def _validate_half_open_lease_seconds(cls, lease_seconds: int) -> int:
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or lease_seconds <= 0
+            or lease_seconds > cls.MAX_HALF_OPEN_LEASE_SECONDS
+        ):
+            raise ValueError("lease_seconds must be a positive integer no greater than 3600")
+        return lease_seconds
+
+    @staticmethod
+    def _validate_half_open_lease_token(lease_token: str) -> str:
+        if not isinstance(lease_token, str) or _HALF_OPEN_LEASE_TOKEN_PATTERN.fullmatch(lease_token) is None:
+            raise ValueError("lease_token has an invalid format")
+        return lease_token
 
     @classmethod
     def _normalize_profile_ids(cls, profile_ids: Sequence[str]) -> tuple[str, ...]:

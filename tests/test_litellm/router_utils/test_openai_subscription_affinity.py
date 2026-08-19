@@ -7,6 +7,9 @@ import pytest
 
 from litellm.caching.dual_cache import DualCache
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileHalfOpenLease,
+    OpenAIProfileState,
+    OpenAIProfileStateSnapshot,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
 )
@@ -15,6 +18,7 @@ USER_KEY_HASH = "a" * 64
 PROFILE_ID = "openai-oauth-1"
 AFFINITY_KEY = f"openai_subscription_affinity:{{v1}}:binding:{USER_KEY_HASH}"
 COUNTER_KEY = "openai_subscription_affinity:{v1}:counter"
+PROFILE_STATE_KEY = "openai_subscription_affinity:{v1}:profile:openai-oauth-1"
 
 
 def make_store(response: object = None) -> tuple[OpenAISubscriptionAffinityStore, AsyncMock]:
@@ -299,6 +303,360 @@ async def test_redis_can_be_attached_after_store_construction() -> None:
     cache.attach_redis_cache(redis_cache)
 
     assert await store.get_profile(USER_KEY_HASH) == PROFILE_ID
+
+
+def test_profile_state_key_contains_only_safe_profile_identifier() -> None:
+    state_key = OpenAISubscriptionAffinityStore.get_profile_state_cache_key(PROFILE_ID)
+
+    assert state_key == PROFILE_STATE_KEY
+    assert "{v1}" in state_key
+    assert USER_KEY_HASH not in state_key
+
+
+@pytest.mark.asyncio
+async def test_unknown_profile_defaults_to_available_without_persisted_record() -> None:
+    store, script = make_store([b"missing"])
+
+    snapshot = await store.get_profile_state(PROFILE_ID)
+
+    assert snapshot == OpenAIProfileStateSnapshot(
+        state=OpenAIProfileState.AVAILABLE,
+        reset_at=None,
+        lease_expires_at=None,
+        reason_code=None,
+        updated_at=None,
+        persisted=False,
+    )
+    script.assert_awaited_once_with(
+        keys=(PROFILE_STATE_KEY,),
+        args=("read",),
+        client=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            [b"found", b"available", b"", b"", b"", b"1700000000"],
+            OpenAIProfileStateSnapshot(
+                state=OpenAIProfileState.AVAILABLE,
+                reset_at=None,
+                lease_expires_at=None,
+                reason_code=None,
+                updated_at=1700000000,
+                persisted=True,
+            ),
+        ),
+        (
+            [b"found", b"cooldown", b"1700000100", b"", b"rate_limit", b"1700000000"],
+            OpenAIProfileStateSnapshot(
+                state=OpenAIProfileState.COOLDOWN,
+                reset_at=1700000100,
+                lease_expires_at=None,
+                reason_code="rate_limit",
+                updated_at=1700000000,
+                persisted=True,
+            ),
+        ),
+        (
+            [
+                b"found",
+                b"half_open",
+                b"1700000100",
+                b"1700000200",
+                b"rate_limit",
+                b"1700000150",
+            ],
+            OpenAIProfileStateSnapshot(
+                state=OpenAIProfileState.HALF_OPEN,
+                reset_at=1700000100,
+                lease_expires_at=1700000200,
+                reason_code="rate_limit",
+                updated_at=1700000150,
+                persisted=True,
+            ),
+        ),
+        (
+            [b"found", b"disabled", b"", b"", b"auth_error", b"1700000000"],
+            OpenAIProfileStateSnapshot(
+                state=OpenAIProfileState.DISABLED,
+                reset_at=None,
+                lease_expires_at=None,
+                reason_code="auth_error",
+                updated_at=1700000000,
+                persisted=True,
+            ),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_profile_state_reads_valid_persisted_shapes(
+    response: object,
+    expected: OpenAIProfileStateSnapshot,
+) -> None:
+    store, _ = make_store(response)
+
+    assert await store.get_profile_state(PROFILE_ID) == expected
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        [b"invalid"],
+        [b"found", b"unknown", b"", b"", b"", b"1700000000"],
+        [b"found", b"available", b"1700000100", b"", b"", b"1700000000"],
+        [b"found", b"cooldown", b"1700000100", b"", b"", b"1700000000"],
+        [b"found", b"half_open", b"1700000100", b"", b"rate_limit", b"1700000000"],
+        [b"found", b"disabled", b"1700000100", b"", b"auth_error", b"1700000000"],
+        [b"found", b"disabled", b"", b"", b"Unsafe Value", b"1700000000"],
+        [b"found", b"disabled", b"", b"", b"auth_error", b"not-a-time"],
+    ],
+)
+@pytest.mark.asyncio
+async def test_profile_state_fails_closed_on_malformed_data(response: object) -> None:
+    store, _ = make_store(response)
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await store.get_profile_state(PROFILE_ID)
+
+
+@pytest.mark.asyncio
+async def test_mark_profile_available_uses_atomic_state_script() -> None:
+    store, script = make_store([b"updated"])
+
+    await store.mark_profile_available(PROFILE_ID)
+
+    script.assert_awaited_once_with(
+        keys=(PROFILE_STATE_KEY,),
+        args=("mark_available",),
+        client=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_profile_cooldown_uses_safe_reason_and_absolute_reset() -> None:
+    store, script = make_store([b"updated"])
+
+    await store.mark_profile_cooldown(PROFILE_ID, 1700000100, "rate_limit")
+
+    script.assert_awaited_once_with(
+        keys=(PROFILE_STATE_KEY,),
+        args=("mark_cooldown", "1700000100", "rate_limit"),
+        client=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_disable_profile_uses_only_safe_reason_code() -> None:
+    store, script = make_store([b"updated"])
+
+    await store.disable_profile(PROFILE_ID, "auth_error")
+
+    script.assert_awaited_once_with(
+        keys=(PROFILE_STATE_KEY,),
+        args=("disable", "auth_error"),
+        client=None,
+    )
+
+
+@pytest.mark.parametrize("reset_at", [0, -1, True, 253402300800])
+@pytest.mark.asyncio
+async def test_cooldown_rejects_invalid_reset_timestamp(reset_at: Any) -> None:
+    store, script = make_store([b"updated"])
+
+    with pytest.raises(ValueError, match="reset_at"):
+        await store.mark_profile_cooldown(PROFILE_ID, reset_at, "rate_limit")
+    script.assert_not_awaited()
+
+
+@pytest.mark.parametrize("reason_code", ["", "UPPERCASE", "raw provider error", "x" * 65])
+@pytest.mark.asyncio
+async def test_profile_state_rejects_unsafe_reason_codes(reason_code: str) -> None:
+    store, script = make_store([b"updated"])
+
+    with pytest.raises(ValueError, match="reason_code"):
+        await store.disable_profile(PROFILE_ID, reason_code)
+    script.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_half_open_acquisition_returns_private_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+    store, script = make_store([b"acquired", b"1700000030"])
+    monkeypatch.setattr(
+        "litellm.router_utils.openai_subscription_affinity.secrets.token_hex",
+        lambda _: "b" * 32,
+    )
+
+    lease = await store.acquire_profile_half_open_lease(PROFILE_ID, lease_seconds=30)
+
+    assert lease == OpenAIProfileHalfOpenLease(
+        profile_id=PROFILE_ID,
+        token="b" * 32,
+        expires_at=1700000030,
+    )
+    script.assert_awaited_once_with(
+        keys=(PROFILE_STATE_KEY,),
+        args=("acquire_half_open", "b" * 32, "30"),
+        client=None,
+    )
+    assert "b" * 32 not in repr(lease)
+
+
+@pytest.mark.parametrize("state", list(OpenAIProfileState))
+@pytest.mark.asyncio
+async def test_half_open_acquisition_returns_none_when_lease_is_not_available(
+    state: OpenAIProfileState,
+) -> None:
+    store, _ = make_store([b"not_acquired", state.value.encode()])
+
+    assert await store.acquire_profile_half_open_lease(PROFILE_ID) is None
+
+
+@pytest.mark.parametrize("lease_seconds", [0, -1, True, 3601])
+@pytest.mark.asyncio
+async def test_half_open_acquisition_rejects_invalid_duration(lease_seconds: Any) -> None:
+    store, script = make_store([b"acquired", b"1700000030"])
+
+    with pytest.raises(ValueError, match="lease_seconds"):
+        await store.acquire_profile_half_open_lease(PROFILE_ID, lease_seconds)
+    script.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [None, [b"invalid"], [b"not_acquired", b"unknown"], [b"acquired", b"not-a-time"]],
+)
+@pytest.mark.asyncio
+async def test_half_open_acquisition_fails_closed_on_invalid_response(response: object) -> None:
+    store, _ = make_store(response)
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await store.acquire_profile_half_open_lease(PROFILE_ID)
+
+
+@pytest.mark.parametrize(
+    ("target_state", "reset_at", "reason_code", "expected_args"),
+    [
+        (
+            OpenAIProfileState.AVAILABLE,
+            None,
+            None,
+            ("complete_half_open", "c" * 32, "available", "", ""),
+        ),
+        (
+            OpenAIProfileState.COOLDOWN,
+            1700000200,
+            "rate_limit",
+            ("complete_half_open", "c" * 32, "cooldown", "1700000200", "rate_limit"),
+        ),
+        (
+            OpenAIProfileState.DISABLED,
+            None,
+            "auth_error",
+            ("complete_half_open", "c" * 32, "disabled", "", "auth_error"),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_half_open_completion_applies_supported_target(
+    target_state: OpenAIProfileState,
+    reset_at: int | None,
+    reason_code: str | None,
+    expected_args: tuple[str, ...],
+) -> None:
+    store, script = make_store([b"applied"])
+
+    assert (
+        await store.complete_profile_half_open(
+            PROFILE_ID,
+            "c" * 32,
+            target_state,
+            reset_at=reset_at,
+            reason_code=reason_code,
+        )
+        is True
+    )
+    script.assert_awaited_once_with(
+        keys=(PROFILE_STATE_KEY,),
+        args=expected_args,
+        client=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_half_open_completion_does_not_apply_stale_lease() -> None:
+    store, _ = make_store([b"stale"])
+
+    assert (
+        await store.complete_profile_half_open(
+            PROFILE_ID,
+            "c" * 32,
+            OpenAIProfileState.AVAILABLE,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("lease_token", "target_state", "reset_at", "reason_code", "message"),
+    [
+        ("invalid", OpenAIProfileState.AVAILABLE, None, None, "lease_token"),
+        ("c" * 32, OpenAIProfileState.HALF_OPEN, None, None, "target_state"),
+        ("c" * 32, "available", None, None, "target_state"),
+        ("c" * 32, OpenAIProfileState.AVAILABLE, 1, None, "does not accept"),
+        ("c" * 32, OpenAIProfileState.COOLDOWN, None, "rate_limit", "requires"),
+        ("c" * 32, OpenAIProfileState.DISABLED, 1, "auth_error", "without reset_at"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_half_open_completion_rejects_invalid_contract(
+    lease_token: str,
+    target_state: Any,
+    reset_at: int | None,
+    reason_code: str | None,
+    message: str,
+) -> None:
+    store, script = make_store([b"applied"])
+
+    with pytest.raises(ValueError, match=message):
+        await store.complete_profile_half_open(
+            PROFILE_ID,
+            lease_token,
+            target_state,
+            reset_at=reset_at,
+            reason_code=reason_code,
+        )
+    script.assert_not_awaited()
+
+
+@pytest.mark.parametrize("operation", ["available", "cooldown", "disabled"])
+@pytest.mark.asyncio
+async def test_corrupt_profile_state_cannot_be_silently_overwritten(operation: str) -> None:
+    store, _ = make_store([b"invalid"])
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        if operation == "available":
+            await store.mark_profile_available(PROFILE_ID)
+        elif operation == "cooldown":
+            await store.mark_profile_cooldown(PROFILE_ID, 1700000100, "rate_limit")
+        else:
+            await store.disable_profile(PROFILE_ID, "auth_error")
+
+
+@pytest.mark.asyncio
+async def test_profile_state_storage_failure_does_not_expose_internal_values() -> None:
+    store, script = make_store()
+    script.side_effect = ConnectionError(f"failed profile={PROFILE_ID} reason=auth_error token={'d' * 32}")
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError) as exc_info:
+        await store.disable_profile(PROFILE_ID, "auth_error")
+
+    message = str(exc_info.value)
+    assert PROFILE_ID not in message
+    assert "auth_error" not in message
+    assert "d" * 32 not in message
 
 
 def test_store_does_not_change_existing_deployment_affinity_namespace() -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 from collections import Counter
 
 import pytest
@@ -19,7 +20,9 @@ import pytest_asyncio
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileState,
     OpenAISubscriptionAffinityStore,
+    OpenAISubscriptionAffinityStoreError,
 )
 from litellm.router_utils.pre_call_checks.openai_subscription_affinity_check import (
     OpenAISubscriptionAffinityCheck,
@@ -328,3 +331,257 @@ async def test_profile_binding_is_shared_across_model_groups(
     assert first == [gpt_deployments[0]]
     assert second == [codex_deployments[0]]
     assert await affinity_store.get_profile(user_hash) == "subscription-a"
+
+
+@pytest.mark.asyncio
+async def test_unknown_profile_state_is_available_without_redis_write(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    state_key = affinity_store.get_profile_state_cache_key(profile_id)
+    redis_cache = affinity_store.cache.redis_cache
+    assert redis_cache is not None
+    raw_redis_client = redis_cache.init_async_client()
+
+    snapshot = await affinity_store.get_profile_state(profile_id)
+
+    assert snapshot.state is OpenAIProfileState.AVAILABLE
+    assert snapshot.persisted is False
+    assert await raw_redis_client.exists(state_key) == 0
+
+
+@pytest.mark.asyncio
+async def test_profile_state_survives_store_restart(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    await affinity_store.disable_profile("subscription-a", "auth_error")
+
+    restarted_store = OpenAISubscriptionAffinityStore(
+        DualCache(redis_cache=RedisCache(host=REDIS_HOST, port=REDIS_PORT))
+    )
+    snapshot = await restarted_store.get_profile_state("subscription-a")
+
+    assert snapshot.state is OpenAIProfileState.DISABLED
+    assert snapshot.reason_code == "auth_error"
+    assert snapshot.persisted is True
+
+
+@pytest.mark.asyncio
+async def test_profile_state_transitions_clear_obsolete_fields(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    await affinity_store.mark_profile_cooldown(profile_id, reset_at=1, reason_code="rate_limit")
+    cooldown = await affinity_store.get_profile_state(profile_id)
+
+    lease = await affinity_store.acquire_profile_half_open_lease(profile_id, lease_seconds=30)
+    half_open = await affinity_store.get_profile_state(profile_id)
+    assert lease is not None
+    assert cooldown.state is OpenAIProfileState.COOLDOWN
+    assert half_open.state is OpenAIProfileState.HALF_OPEN
+    assert half_open.reset_at == 1
+    assert half_open.reason_code == "rate_limit"
+    assert half_open.lease_expires_at == lease.expires_at
+
+    assert (
+        await affinity_store.complete_profile_half_open(
+            profile_id,
+            lease.token,
+            OpenAIProfileState.AVAILABLE,
+        )
+        is True
+    )
+    available = await affinity_store.get_profile_state(profile_id)
+    assert available.state is OpenAIProfileState.AVAILABLE
+    assert available.reset_at is None
+    assert available.lease_expires_at is None
+    assert available.reason_code is None
+
+
+@pytest.mark.asyncio
+async def test_cooldown_cannot_be_probed_before_reset(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    await affinity_store.mark_profile_cooldown(
+        "subscription-a",
+        reset_at=int(time.time()) + 60,
+        reason_code="rate_limit",
+    )
+
+    assert (
+        await affinity_store.acquire_profile_half_open_lease(
+            "subscription-a",
+            lease_seconds=30,
+        )
+        is None
+    )
+    assert (await affinity_store.get_profile_state("subscription-a")).state is OpenAIProfileState.COOLDOWN
+
+
+@pytest.mark.asyncio
+async def test_parallel_half_open_acquisition_has_one_winner(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    await affinity_store.mark_profile_cooldown(profile_id, reset_at=1, reason_code="rate_limit")
+
+    leases = await asyncio.gather(
+        *(affinity_store.acquire_profile_half_open_lease(profile_id, lease_seconds=30) for _ in range(64))
+    )
+
+    winners = [lease for lease in leases if lease is not None]
+    assert len(winners) == 1
+    snapshot = await affinity_store.get_profile_state(profile_id)
+    assert snapshot.state is OpenAIProfileState.HALF_OPEN
+    assert snapshot.lease_expires_at == winners[0].expires_at
+
+
+@pytest.mark.asyncio
+async def test_expired_half_open_lease_is_replaced_and_old_owner_is_rejected(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    await affinity_store.mark_profile_cooldown(profile_id, reset_at=1, reason_code="rate_limit")
+    old_lease = await affinity_store.acquire_profile_half_open_lease(profile_id, lease_seconds=1)
+    assert old_lease is not None
+
+    await asyncio.sleep(1.1)
+
+    new_lease = await affinity_store.acquire_profile_half_open_lease(profile_id, lease_seconds=30)
+    assert new_lease is not None
+    assert new_lease.token != old_lease.token
+    assert (
+        await affinity_store.complete_profile_half_open(
+            profile_id,
+            old_lease.token,
+            OpenAIProfileState.AVAILABLE,
+        )
+        is False
+    )
+    assert (
+        await affinity_store.complete_profile_half_open(
+            profile_id,
+            new_lease.token,
+            OpenAIProfileState.AVAILABLE,
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_half_open_completion_can_return_profile_to_cooldown(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    await affinity_store.mark_profile_cooldown(profile_id, reset_at=1, reason_code="rate_limit")
+    lease = await affinity_store.acquire_profile_half_open_lease(profile_id)
+    assert lease is not None
+    next_reset = int(time.time()) + 120
+
+    assert (
+        await affinity_store.complete_profile_half_open(
+            profile_id,
+            lease.token,
+            OpenAIProfileState.COOLDOWN,
+            reset_at=next_reset,
+            reason_code="rate_limit",
+        )
+        is True
+    )
+    snapshot = await affinity_store.get_profile_state(profile_id)
+    assert snapshot.state is OpenAIProfileState.COOLDOWN
+    assert snapshot.reset_at == next_reset
+    assert snapshot.reason_code == "rate_limit"
+    assert snapshot.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_half_open_completion_can_disable_profile(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    await affinity_store.mark_profile_cooldown(profile_id, reset_at=1, reason_code="rate_limit")
+    lease = await affinity_store.acquire_profile_half_open_lease(profile_id)
+    assert lease is not None
+
+    assert (
+        await affinity_store.complete_profile_half_open(
+            profile_id,
+            lease.token,
+            OpenAIProfileState.DISABLED,
+            reason_code="auth_error",
+        )
+        is True
+    )
+    snapshot = await affinity_store.get_profile_state(profile_id)
+    assert snapshot.state is OpenAIProfileState.DISABLED
+    assert snapshot.reason_code == "auth_error"
+    assert snapshot.reset_at is None
+    assert snapshot.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_corrupted_profile_hash_fails_closed_and_is_not_overwritten(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    state_key = affinity_store.get_profile_state_cache_key(profile_id)
+    redis_cache = affinity_store.cache.redis_cache
+    assert redis_cache is not None
+    raw_redis_client = redis_cache.init_async_client()
+    await raw_redis_client.hset(
+        state_key,
+        mapping={
+            "state": "cooldown",
+            "reset_at": "1700000000",
+            "updated_at": "1700000000",
+        },
+    )
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await affinity_store.get_profile_state(profile_id)
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await affinity_store.mark_profile_available(profile_id)
+
+    assert await raw_redis_client.hget(state_key, "state") == b"cooldown"
+    assert await raw_redis_client.hget(state_key, "reason") is None
+
+
+@pytest.mark.asyncio
+async def test_profile_hash_with_unknown_field_fails_closed(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_id = "subscription-a"
+    state_key = affinity_store.get_profile_state_cache_key(profile_id)
+    redis_cache = affinity_store.cache.redis_cache
+    assert redis_cache is not None
+    raw_redis_client = redis_cache.init_async_client()
+    await raw_redis_client.hset(
+        state_key,
+        mapping={
+            "state": "disabled",
+            "reason": "auth_error",
+            "updated_at": "1700000000",
+            "unexpected": "must-not-be-accepted",
+        },
+    )
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await affinity_store.get_profile_state(profile_id)
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await affinity_store.disable_profile(profile_id, "auth_error")
+
+    assert await raw_redis_client.hget(state_key, "unexpected") == b"must-not-be-accepted"
+
+
+@pytest.mark.asyncio
+async def test_profile_availability_state_does_not_change_virtual_key_binding(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(50)
+    await affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=60)
+
+    await affinity_store.disable_profile("subscription-a", "auth_error")
+
+    assert await affinity_store.get_profile(user_hash) == "subscription-a"
+    assert await affinity_store.get_remaining_ttl(user_hash) in range(1, 61)
