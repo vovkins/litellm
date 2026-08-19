@@ -9,6 +9,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+import litellm
 from litellm.llms.chatgpt.authenticator import (
     Authenticator,
     get_cached_authenticator,
@@ -90,6 +91,33 @@ def _write_auth_record(path, token: str, account_id: str) -> None:
 
 
 class TestChatGPTMultiAccountAuthenticator:
+    def test_router_initialization_uses_explicit_auth_file(self, tmp_path, monkeypatch):
+        auth_file = tmp_path / "account-a" / "auth.json"
+        _write_auth_record(auth_file, "token-a", "acct-a")
+
+        def reject_device_login(_self):
+            raise AssertionError("Router must not fall back to interactive device login")
+
+        monkeypatch.setattr(Authenticator, "_login_device_code", reject_device_login)
+        router = litellm.Router(
+            model_list=[
+                {
+                    "model_name": "gpt-5.4",
+                    "litellm_params": {
+                        "model": "chatgpt/gpt-5.4",
+                        "chatgpt_auth_file": str(auth_file),
+                    },
+                    "model_info": {"id": "chatgpt-account-a"},
+                }
+            ]
+        )
+        try:
+            deployment = router.get_deployment(model_id="chatgpt-account-a")
+            assert deployment is not None
+            assert deployment.litellm_params.chatgpt_auth_file == str(auth_file)
+        finally:
+            router.discard()
+
     def test_explicit_auth_file_overrides_env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path / "env-dir"))
         monkeypatch.setenv("CHATGPT_AUTH_FILE", "env.json")

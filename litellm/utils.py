@@ -906,9 +906,12 @@ def function_setup(
                     # If custom_llm_provider not in kwargs, try to determine it from the model
                     if not custom_llm_provider and model:
                         try:
+                            from litellm.types.router import GenericLiteLLMParams
+
                             _, custom_llm_provider, _, _ = get_llm_provider(
                                 model=model,
                                 custom_llm_provider=custom_llm_provider,
+                                litellm_params=GenericLiteLLMParams(**kwargs),
                             )
                         except Exception:
                             # If we can't determine the provider, skip this processing
@@ -2199,9 +2202,7 @@ def supports_native_streaming(model: str, custom_llm_provider: str | None) -> bo
     Exception: If the given model is not found in model_prices_and_context_window.json.
     """
     try:
-        model, custom_llm_provider, _, _ = litellm.get_llm_provider(
-            model=model, custom_llm_provider=custom_llm_provider
-        )
+        model, custom_llm_provider = _resolve_model_for_capability_check(model, custom_llm_provider)
 
         model_info: Final = _get_model_info_helper(model=model, custom_llm_provider=custom_llm_provider)
         supports_native_streaming = model_info.get("supports_native_streaming", True)
@@ -2328,9 +2329,7 @@ def _supports_factory(model: str, custom_llm_provider: str | None, key: str) -> 
     Exception: If the given model is not found or there's an error in retrieval.
     """
     try:
-        model, custom_llm_provider, _, _ = litellm.get_llm_provider(
-            model=model, custom_llm_provider=custom_llm_provider
-        )
+        model, custom_llm_provider = _resolve_model_for_capability_check(model, custom_llm_provider)
 
         model_info: Final = _get_model_info_helper(model=model, custom_llm_provider=custom_llm_provider)
 
@@ -2405,6 +2404,17 @@ def _is_explicitly_disabled_factory(model: str, custom_llm_provider: str | None,
             e,
         )
         return False
+
+
+def _resolve_model_for_capability_check(
+    model: str, custom_llm_provider: str | None
+) -> tuple[str, str | None]:
+    if custom_llm_provider == "chatgpt" or model.startswith("chatgpt/"):
+        return model.removeprefix("chatgpt/"), "chatgpt"
+    model, custom_llm_provider, _, _ = litellm.get_llm_provider(
+        model=model, custom_llm_provider=custom_llm_provider
+    )
+    return model, custom_llm_provider
 
 
 def supports_audio_input(model: str, custom_llm_provider: str | None = None) -> bool:

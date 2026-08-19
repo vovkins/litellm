@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from litellm.exceptions import (
     Timeout,
 )
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.llms.chatgpt.authenticator import Authenticator
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileState,
     OpenAISubscriptionAffinityStore,
@@ -94,6 +96,7 @@ class EmulatedPool:
     store: OpenAISubscriptionAffinityStore
     auth_files: dict[str, Path]
     routers: list[litellm.Router]
+    device_login_attempts: list[str]
 
     def make_router(
         self,
@@ -155,9 +158,14 @@ async def emulated_pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     emulator = OpenAISubscriptionEmulator(tokens).start()
     monkeypatch.setenv("CHATGPT_API_BASE", emulator.base_url)
     monkeypatch.setenv("OPENAI_CHATGPT_API_BASE", emulator.base_url)
-    default_auth_file = tmp_path / "unused-default" / "auth.json"
-    _write_auth_file(default_auth_file, tokens[PROFILE_A], PROFILE_A)
-    monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(default_auth_file.parent))
+
+    device_login_attempts: list[str] = []
+
+    def reject_device_login(_self):
+        device_login_attempts.append("".join(traceback.format_stack(limit=12)))
+        raise AssertionError("per-profile routing must not use interactive device login")
+
+    monkeypatch.setattr(Authenticator, "_login_device_code", reject_device_login)
 
     redis_cache = RedisCache(host=REDIS_HOST, port=REDIS_PORT)
     redis_client = redis_cache.init_async_client()
@@ -165,7 +173,13 @@ async def emulated_pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     store = OpenAISubscriptionAffinityStore(DualCache(redis_cache=redis_cache))
     original_callbacks = list(litellm.callbacks)
     litellm.callbacks = []
-    pool = EmulatedPool(emulator=emulator, store=store, auth_files=auth_files, routers=[])
+    pool = EmulatedPool(
+        emulator=emulator,
+        store=store,
+        auth_files=auth_files,
+        routers=[],
+        device_login_attempts=device_login_attempts,
+    )
     try:
         yield pool
     finally:
@@ -177,6 +191,7 @@ async def emulated_pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         litellm.callbacks = original_callbacks
         emulator.stop()
         await redis_client.flushdb()
+        assert not device_login_attempts, device_login_attempts[0]
 
 
 async def test_real_router_reaches_emulator_and_persists_affinity(emulated_pool: EmulatedPool) -> None:
@@ -308,8 +323,8 @@ async def test_streaming_completion_uses_real_router_and_refreshes_binding(emula
         for chunk in chunks
         if chunk.choices and chunk.choices[0].delta.content is not None
     )
-    assert streamed_text == "emulated stream"
     assert emulated_pool.emulator.requests[0].streaming is True
+    assert streamed_text == "emulated stream"
     assert await emulated_pool.store.get_profile(user_hash) == PROFILE_A
     assert await emulated_pool.store.get_remaining_ttl(user_hash) in range(4, 6)
 

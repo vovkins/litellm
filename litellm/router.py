@@ -4591,6 +4591,7 @@ class Router:
                 _, inferred_custom_llm_provider, _, _ = get_llm_provider(
                     model=data["model"],
                     custom_llm_provider=custom_llm_provider,
+                    litellm_params=LiteLLM_Params(**data),
                 )
                 custom_llm_provider = custom_llm_provider or inferred_custom_llm_provider
             except Exception:
@@ -8118,6 +8119,7 @@ class Router:
             ) = litellm.get_llm_provider(
                 model=deployment.litellm_params.model,
                 custom_llm_provider=deployment.litellm_params.get("custom_llm_provider", None),
+                litellm_params=deployment.litellm_params,
             )
             # done reading model["litellm_params"]
             # Check if provider is supported: either in enum or JSON-configured
@@ -8972,7 +8974,10 @@ class Router:
         else:
             model_info_name = model
 
-        model_info: Final = litellm.get_model_info(model=model_info_name)
+        model_info: Final = litellm.get_model_info(
+            model=model_info_name,
+            custom_llm_provider=custom_llm_provider,
+        )
 
         ## CHECK USER SET MODEL INFO
         user_model_info: Final = deployment.get("model_info") or {}
@@ -9010,7 +9015,12 @@ class Router:
         model_name: Final = model_info["model_name"]
         return self.get_model_list(model_name=model_name)
 
-    def get_deployment_model_info(self, model_id: str, model_name: str) -> ModelInfo | None:
+    def get_deployment_model_info(
+        self,
+        model_id: str,
+        model_name: str,
+        custom_llm_provider: str | None = None,
+    ) -> ModelInfo | None:
         """
         For a given model id, return the model info
 
@@ -9030,7 +9040,13 @@ class Router:
             pass
 
         try:
-            litellm_model_name_model_info = litellm.get_model_info(model=model_name)
+            if custom_llm_provider is None:
+                litellm_model_name_model_info = litellm.get_model_info(model=model_name)
+            else:
+                litellm_model_name_model_info = litellm.get_model_info(
+                    model=model_name,
+                    custom_llm_provider=custom_llm_provider,
+                )
         except Exception:
             pass
 
@@ -9141,25 +9157,30 @@ class Router:
             if _deployment_otpm is None:
                 _deployment_otpm = model_info_dict.get("otpm", None)
 
-            # get model info
-            try:
-                model_id = model_info_dict.get("id", None)
-                if model_id is not None:
-                    model_info = self.get_deployment_model_info(model_id=model_id, model_name=litellm_params.model)
-                else:
-                    model_info = None
-            except Exception:
-                model_info = None
-
             # get llm provider
             litellm_model, llm_provider = "", ""
             try:
                 litellm_model, llm_provider, _, _ = litellm.get_llm_provider(
                     model=litellm_params.model,
                     custom_llm_provider=litellm_params.custom_llm_provider,
+                    litellm_params=litellm_params,
                 )
             except litellm.exceptions.BadRequestError as e:
                 verbose_router_logger.error("litellm.router.py::get_model_group_info() - %s", e)
+
+            # get model info
+            try:
+                model_id = model_info_dict.get("id", None)
+                if model_id is not None:
+                    model_info = self.get_deployment_model_info(
+                        model_id=model_id,
+                        model_name=litellm_params.model,
+                        custom_llm_provider=litellm_params.custom_llm_provider or llm_provider,
+                    )
+                else:
+                    model_info = None
+            except Exception:
+                model_info = None
 
             if model_info is None:
                 supported_openai_params = litellm.get_supported_openai_params(

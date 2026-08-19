@@ -593,10 +593,18 @@ async def acompletion(
         "enable_json_schema_validation": enable_json_schema_validation,
     }
     if custom_llm_provider is None:
+        _supplemental_provider_params: Final = {
+            key: kwargs[key] for key in OPTIONAL_KWARGS_KEYS if key in kwargs
+        }
         _, custom_llm_provider, _, _ = get_llm_provider(
             model=model,
             custom_llm_provider=custom_llm_provider,
             api_base=completion_kwargs.get("base_url", None),
+            litellm_params=(
+                GenericLiteLLMParams(**_supplemental_provider_params)
+                if _supplemental_provider_params
+                else None
+            ),
         )
 
     fallbacks = fallbacks or litellm.model_fallbacks

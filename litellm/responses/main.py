@@ -440,8 +440,11 @@ async def aresponses(
 
         # get custom llm provider so we can use this for mapping exceptions
         if custom_llm_provider is None:
+            litellm_params: Final = GenericLiteLLMParams(**kwargs)
             _, custom_llm_provider, _, _ = litellm.get_llm_provider(
-                model=model, api_base=local_vars.get("base_url", None)
+                model=model,
+                api_base=local_vars.get("base_url", None),
+                litellm_params=litellm_params,
             )
             # Update local_vars with detected provider (fixes #19782)
             local_vars["custom_llm_provider"] = custom_llm_provider

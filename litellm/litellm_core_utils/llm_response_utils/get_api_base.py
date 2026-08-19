@@ -1,3 +1,4 @@
+import os
 from typing import Final
 
 import litellm
@@ -40,6 +41,11 @@ def get_api_base(model: str, optional_params: dict | LiteLLM_Params) -> str | No
     if _optional_params.api_base is not None:
         return _optional_params.api_base
 
+    if _optional_params.custom_llm_provider == "chatgpt":
+        from litellm.llms.chatgpt.common_utils import CHATGPT_API_BASE
+
+        return os.getenv("CHATGPT_API_BASE") or os.getenv("OPENAI_CHATGPT_API_BASE") or CHATGPT_API_BASE
+
     if litellm.model_alias_map and model in litellm.model_alias_map:
         model = litellm.model_alias_map[model]
     try:
@@ -53,6 +59,7 @@ def get_api_base(model: str, optional_params: dict | LiteLLM_Params) -> str | No
             custom_llm_provider=_optional_params.custom_llm_provider,
             api_base=_optional_params.api_base,
             api_key=_optional_params.api_key,
+            litellm_params=_optional_params,
         )
     except Exception as e:
         verbose_logger.debug("Error occurred in getting api base - %s", e)
