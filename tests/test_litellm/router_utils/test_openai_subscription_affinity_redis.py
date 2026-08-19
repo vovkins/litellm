@@ -21,6 +21,9 @@ from litellm.caching.redis_cache import RedisCache
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAISubscriptionAffinityStore,
 )
+from litellm.router_utils.pre_call_checks.openai_subscription_affinity_check import (
+    OpenAISubscriptionAffinityCheck,
+)
 
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -301,3 +304,27 @@ async def test_delayed_success_cannot_extend_newer_profile_binding(
 
     assert await affinity_store.get_profile(user_hash) == "subscription-b"
     assert await affinity_store.get_remaining_ttl(user_hash) in range(1, 6)
+
+
+@pytest.mark.asyncio
+async def test_profile_binding_is_shared_across_model_groups(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    callback = OpenAISubscriptionAffinityCheck(store=affinity_store, ttl_seconds=60)
+    user_hash = _user_hash(40)
+    gpt_deployments = [
+        {"model_info": {"id": "gpt-a", "openai_oauth_profile": "subscription-a"}},
+        {"model_info": {"id": "gpt-b", "openai_oauth_profile": "subscription-b"}},
+    ]
+    codex_deployments = [
+        {"model_info": {"id": "codex-a", "openai_oauth_profile": "subscription-a"}},
+        {"model_info": {"id": "codex-b", "openai_oauth_profile": "subscription-b"}},
+    ]
+    request_kwargs = {"metadata": {"user_api_key_hash": user_hash}}
+
+    first = await callback.async_filter_deployments("gpt-5.4", gpt_deployments, None, request_kwargs)
+    second = await callback.async_filter_deployments("gpt-5.3-codex", codex_deployments, None, request_kwargs)
+
+    assert first == [gpt_deployments[0]]
+    assert second == [codex_deployments[0]]
+    assert await affinity_store.get_profile(user_hash) == "subscription-a"

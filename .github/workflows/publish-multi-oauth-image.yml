@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Immutable image version, for example 1.97.0-multi-oauth.3"
+        description: "Immutable image version, for example 1.97.0-multi-oauth.4"
         required: true
-        default: "1.97.0-multi-oauth.3"
+        default: "1.97.0-multi-oauth.4"
         type: string
       commit_sha:
         description: "Full 40-character commit SHA to build"
@@ -193,6 +193,18 @@ jobs:
             --entrypoint python \
             "litellm-multi-oauth-smoke:${SHORT_SHA}-${ARTIFACT}" \
             -c "import json, os, stat, tempfile; from litellm.llms.chatgpt.authenticator import Authenticator, get_cached_authenticator; from litellm.types.router import GenericLiteLLMParams; root = tempfile.mkdtemp(); path = os.path.join(root, 'account', 'auth.json'); p = GenericLiteLLMParams(chatgpt_auth_file=path); assert p.chatgpt_auth_file == path; a = get_cached_authenticator(path); assert a is get_cached_authenticator(os.path.join(root, 'account', '.', 'auth.json')); payload = {'access_token': 'smoke-token', 'account_id': 'smoke-account', 'expires_at': 4102444800}; assert a._write_auth_file(payload); assert stat.S_IMODE(os.stat(path).st_mode) == 0o600; assert json.load(open(path, encoding='utf-8')) == payload; assert a.get_access_token() == 'smoke-token'"
+
+      - name: Verify subscription-affinity routing is packaged
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint python \
+            "litellm-multi-oauth-smoke:${SHORT_SHA}-${ARTIFACT}" \
+            -c "import asyncio; from litellm.caching.dual_cache import DualCache; from litellm.exceptions import ServiceUnavailableError; from litellm.router_utils.openai_subscription_affinity import OpenAISubscriptionAffinityStore; from litellm.router_utils.pre_call_checks.openai_subscription_affinity_check import OpenAISubscriptionAffinityCheck; callback = OpenAISubscriptionAffinityCheck(OpenAISubscriptionAffinityStore(DualCache())); deployments = [{'model_info': {'id': 'glm'}}]; assert asyncio.run(callback.async_filter_deployments('glm', deployments, None)) == deployments; oauth = [{'model_info': {'id': 'oauth', 'openai_oauth_profile': 'subscription-a'}}]; caught = False; exec('try:\n asyncio.run(callback.async_filter_deployments(\"gpt\", oauth, None))\nexcept ServiceUnavailableError as exc:\n caught = exc.status_code == 503'); assert caught"
 
       - name: Build and publish image by digest
         id: publish

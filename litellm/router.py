@@ -134,6 +134,9 @@ from litellm.router_utils.handle_error import (
     send_llm_exception_alert,
 )
 from litellm.router_utils.health_state_cache import DeploymentHealthCache
+from litellm.router_utils.openai_subscription_affinity import (
+    OpenAISubscriptionAffinityStore,
+)
 from litellm.router_utils.pre_call_checks.deployment_affinity_check import (
     DeploymentAffinityCheck,
     warn_on_unknown_model_group_affinity_flags,
@@ -146,6 +149,9 @@ from litellm.router_utils.pre_call_checks.io_token_rate_limit_check import (
 )
 from litellm.router_utils.pre_call_checks.model_rate_limit_check import (
     ModelRateLimitingCheck,
+)
+from litellm.router_utils.pre_call_checks.openai_subscription_affinity_check import (
+    OpenAISubscriptionAffinityCheck,
 )
 from litellm.router_utils.pre_call_checks.prompt_caching_deployment_check import (
     PromptCachingDeploymentCheck,
@@ -1680,6 +1686,29 @@ class Router:
             return
 
         # ---------------------------------------------------------------------
+        # OpenAI OAuth subscription affinity. Register it before deployment
+        # affinity so a global profile is selected before model-specific checks.
+        # ---------------------------------------------------------------------
+        if "openai_subscription_affinity" in optional_pre_call_checks:
+            if self.optional_callbacks is None:
+                self.optional_callbacks = []
+            existing_openai_affinity = next(
+                (
+                    callback
+                    for callback in self.optional_callbacks
+                    if isinstance(callback, OpenAISubscriptionAffinityCheck)
+                ),
+                None,
+            )
+            if existing_openai_affinity is None:
+                openai_affinity: Final = OpenAISubscriptionAffinityCheck(
+                    store=OpenAISubscriptionAffinityStore(cache=self.cache),
+                    ttl_seconds=self.deployment_affinity_ttl_seconds,
+                )
+                self.optional_callbacks.append(openai_affinity)
+                litellm.logging_callback_manager.add_litellm_callback(openai_affinity)
+
+        # ---------------------------------------------------------------------
         # Unified deployment affinity (session stickiness)
         # ---------------------------------------------------------------------
         enable_user_key_affinity: Final = "deployment_affinity" in optional_pre_call_checks
@@ -1737,6 +1766,7 @@ class Router:
                 "responses_api_deployment_check",
                 "session_affinity",
                 "encrypted_content_affinity",
+                "openai_subscription_affinity",
             ):
                 continue
             if pre_call_check == "prompt_caching":
