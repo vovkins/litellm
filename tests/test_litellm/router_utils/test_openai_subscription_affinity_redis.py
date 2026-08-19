@@ -132,3 +132,90 @@ async def test_expired_binding_gets_next_round_robin_assignment(
 
     assert first == "subscription-a"
     assert second == "subscription-b"
+
+
+@pytest.mark.asyncio
+async def test_adding_profile_preserves_active_bindings_and_gradually_rebalances(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    original_hashes = [_user_hash(index) for index in range(4)]
+    original_profiles = {
+        user_hash: await affinity_store.get_or_assign_profile(
+            user_hash,
+            ["subscription-a", "subscription-b"],
+            ttl_seconds=300,
+        )
+        for user_hash in original_hashes
+    }
+    original_ttls = {user_hash: await affinity_store.get_remaining_ttl(user_hash) for user_hash in original_hashes}
+
+    restarted_store = OpenAISubscriptionAffinityStore(
+        DualCache(redis_cache=RedisCache(host=REDIS_HOST, port=REDIS_PORT))
+    )
+    preserved_profiles = {
+        user_hash: await restarted_store.get_or_assign_profile(
+            user_hash,
+            ["subscription-c", "subscription-b", "subscription-a"],
+            ttl_seconds=3600,
+        )
+        for user_hash in original_hashes
+    }
+    preserved_ttls = {user_hash: await restarted_store.get_remaining_ttl(user_hash) for user_hash in original_hashes}
+
+    assert preserved_profiles == original_profiles
+    for user_hash in original_hashes:
+        assert original_ttls[user_hash] is not None
+        assert preserved_ttls[user_hash] is not None
+        assert preserved_ttls[user_hash] <= original_ttls[user_hash]
+        assert preserved_ttls[user_hash] < 3600
+
+    new_assignments = [
+        await restarted_store.get_or_assign_profile(
+            _user_hash(index),
+            ["subscription-c", "subscription-a", "subscription-b"],
+            ttl_seconds=300,
+        )
+        for index in range(4, 10)
+    ]
+    assert new_assignments == [
+        "subscription-b",
+        "subscription-c",
+        "subscription-a",
+        "subscription-b",
+        "subscription-c",
+        "subscription-a",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expired_binding_can_move_to_newly_added_profile(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    expiring_hash = _user_hash(20)
+    assert (
+        await affinity_store.get_or_assign_profile(
+            expiring_hash,
+            ["subscription-a", "subscription-b"],
+            ttl_seconds=1,
+        )
+        == "subscription-a"
+    )
+    assert (
+        await affinity_store.get_or_assign_profile(
+            _user_hash(21),
+            ["subscription-a", "subscription-b"],
+            ttl_seconds=60,
+        )
+        == "subscription-b"
+    )
+
+    await asyncio.sleep(1.1)
+
+    assert (
+        await affinity_store.get_or_assign_profile(
+            expiring_hash,
+            ["subscription-c", "subscription-b", "subscription-a"],
+            ttl_seconds=60,
+        )
+        == "subscription-c"
+    )

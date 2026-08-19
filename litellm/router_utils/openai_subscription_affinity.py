@@ -141,6 +141,8 @@ class OpenAISubscriptionAffinityStore:
         Profile order supplied by callers cannot affect distribution: identifiers
         are validated, de-duplicated, and sorted before the Redis script runs.
         An existing binding is returned as-is and its TTL is never refreshed here.
+        Consequently, adding a profile grows the pool only for new or expired
+        bindings instead of redistributing active virtual keys.
         """
 
         cache_key: Final = self.get_cache_key(user_api_key_hash)

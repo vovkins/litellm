@@ -143,16 +143,21 @@ async def test_get_or_assign_profile_normalizes_profiles_and_uses_shared_counter
 
 
 @pytest.mark.asyncio
-async def test_get_or_assign_profile_returns_existing_binding() -> None:
-    store, _ = make_store([b"existing", PROFILE_ID.encode(), b"321"])
+async def test_adding_profile_preserves_existing_binding() -> None:
+    store, script = make_store([b"existing", b"subscription-a", b"321"])
 
     assert (
         await store.get_or_assign_profile(
             USER_KEY_HASH,
-            ["subscription-a", "subscription-b"],
+            ["subscription-c", "subscription-a", "subscription-b"],
             ttl_seconds=86400,
         )
-        == PROFILE_ID
+        == "subscription-a"
+    )
+    script.assert_awaited_once_with(
+        keys=(AFFINITY_KEY, COUNTER_KEY),
+        args=("86400", "3", "subscription-a", "subscription-b", "subscription-c"),
+        client=None,
     )
 
 
