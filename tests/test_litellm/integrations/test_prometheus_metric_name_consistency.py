@@ -93,10 +93,10 @@ def test_all_defined_metrics_have_consistent_naming():
     defined_metrics = get_args(DEFINED_PROMETHEUS_METRICS)
 
     for metric_name in defined_metrics:
-        # All metrics should start with 'litellm_'
+        # The thin ru-llm-proxy fork also exports its bounded project metrics.
         assert metric_name.startswith(
-            "litellm_"
-        ), f"Metric {metric_name} should start with 'litellm_'"
+            ("litellm_", "ru_llm_proxy_")
+        ), f"Metric {metric_name} should start with 'litellm_' or 'ru_llm_proxy_'"
 
 
 if __name__ == "__main__":

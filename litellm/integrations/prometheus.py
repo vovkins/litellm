@@ -446,6 +446,57 @@ class PrometheusLogger(CustomLogger):
                 "Total number of guardrail invocations",
                 labelnames=["guardrail_name", "status", "hook_type"],
             )
+
+            # OpenAI subscription pool metrics. ``mostrecent`` keeps one
+            # logical gauge value across Prometheus multiprocess workers.
+            self.ru_llm_proxy_openai_subscription_available = self._gauge_factory(
+                "ru_llm_proxy_openai_subscription_available",
+                "Whether an OpenAI subscription profile accepts normal traffic (1=yes, 0=no)",
+                labelnames=self.get_labels_for_metric("ru_llm_proxy_openai_subscription_available"),
+                multiprocess_mode="mostrecent",
+            )
+            self.ru_llm_proxy_openai_subscription_limit_used_ratio = self._gauge_factory(
+                "ru_llm_proxy_openai_subscription_limit_used_ratio",
+                "Observed fraction of an OpenAI subscription limit window already used",
+                labelnames=self.get_labels_for_metric("ru_llm_proxy_openai_subscription_limit_used_ratio"),
+                multiprocess_mode="mostrecent",
+            )
+            self.ru_llm_proxy_openai_subscription_limit_remaining_ratio = self._gauge_factory(
+                "ru_llm_proxy_openai_subscription_limit_remaining_ratio",
+                "Observed fraction of an OpenAI subscription limit window remaining",
+                labelnames=self.get_labels_for_metric("ru_llm_proxy_openai_subscription_limit_remaining_ratio"),
+                multiprocess_mode="mostrecent",
+            )
+            self.ru_llm_proxy_openai_subscription_limit_reset_timestamp_seconds = self._gauge_factory(
+                "ru_llm_proxy_openai_subscription_limit_reset_timestamp_seconds",
+                "Observed Unix timestamp when an OpenAI subscription limit window resets",
+                labelnames=self.get_labels_for_metric("ru_llm_proxy_openai_subscription_limit_reset_timestamp_seconds"),
+                multiprocess_mode="mostrecent",
+            )
+            self.ru_llm_proxy_openai_subscription_limit_window_seconds = self._gauge_factory(
+                "ru_llm_proxy_openai_subscription_limit_window_seconds",
+                "Observed duration in seconds of an OpenAI subscription limit window",
+                labelnames=self.get_labels_for_metric("ru_llm_proxy_openai_subscription_limit_window_seconds"),
+                multiprocess_mode="mostrecent",
+            )
+            self.ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds = self._gauge_factory(
+                "ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds",
+                "Unix timestamp of the last valid OpenAI subscription limit observation",
+                labelnames=self.get_labels_for_metric(
+                    "ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds"
+                ),
+                multiprocess_mode="mostrecent",
+            )
+            self.ru_llm_proxy_openai_subscription_failovers_total = self._counter_factory(
+                "ru_llm_proxy_openai_subscription_failovers_total",
+                "Number of affinity bindings released from an unavailable OpenAI subscription profile",
+                labelnames=self.get_labels_for_metric("ru_llm_proxy_openai_subscription_failovers_total"),
+            )
+            self.ru_llm_proxy_openai_subscription_auth_errors_total = self._counter_factory(
+                "ru_llm_proxy_openai_subscription_auth_errors_total",
+                "Number of OpenAI subscription authentication failures observed by profile",
+                labelnames=self.get_labels_for_metric("ru_llm_proxy_openai_subscription_auth_errors_total"),
+            )
             # llm api provider budget metrics
             self.litellm_provider_remaining_budget_metric = self._gauge_factory(
                 "litellm_provider_remaining_budget_metric",
@@ -3241,6 +3292,89 @@ class PrometheusLogger(CustomLogger):
             _sanitize_prometheus_label_value(api_provider),
             _sanitize_prometheus_label_value(exception_status),
         ).inc()
+
+    @staticmethod
+    def _validate_openai_subscription_metric_labels(profile: str, window: str | None = None) -> None:
+        if (
+            not isinstance(profile, str)
+            or not 1 <= len(profile) <= 64
+            or not profile[0].isalnum()
+            or profile.lower() != profile
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in profile)
+        ):
+            raise ValueError("invalid OpenAI subscription profile metric label")
+        if window is not None and window not in {"primary", "secondary"}:
+            raise ValueError("invalid OpenAI subscription window metric label")
+
+    def initialize_openai_subscription_profile_metrics(self, profile: str, available: bool) -> None:
+        """Create bounded profile series without inventing limit observations."""
+
+        self._validate_openai_subscription_metric_labels(profile)
+        self.ru_llm_proxy_openai_subscription_available.labels(profile=profile).set(1 if available else 0)
+        self.ru_llm_proxy_openai_subscription_failovers_total.labels(profile=profile).inc(0)
+        self.ru_llm_proxy_openai_subscription_auth_errors_total.labels(profile=profile).inc(0)
+        for window in ("primary", "secondary"):
+            self.ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds.labels(
+                profile=profile,
+                window=window,
+            ).set(0)
+
+    def set_openai_subscription_profile_available(self, profile: str, available: bool) -> None:
+        self._validate_openai_subscription_metric_labels(profile)
+        self.ru_llm_proxy_openai_subscription_available.labels(profile=profile).set(1 if available else 0)
+
+    def observe_openai_subscription_limit_window(
+        self,
+        *,
+        profile: str,
+        window: str,
+        observed_at: float,
+        used_ratio: float | None,
+        reset_timestamp_seconds: int | None,
+        window_seconds: int | None,
+    ) -> None:
+        """Publish only fields present in a validated provider observation."""
+
+        self._validate_openai_subscription_metric_labels(profile, window)
+        if not math.isfinite(observed_at) or observed_at <= 0:
+            raise ValueError("invalid OpenAI subscription observation timestamp")
+        if used_ratio is not None:
+            if not math.isfinite(used_ratio) or not 0 <= used_ratio <= 1:
+                raise ValueError("invalid OpenAI subscription used ratio")
+            self.ru_llm_proxy_openai_subscription_limit_used_ratio.labels(
+                profile=profile,
+                window=window,
+            ).set(used_ratio)
+            self.ru_llm_proxy_openai_subscription_limit_remaining_ratio.labels(
+                profile=profile,
+                window=window,
+            ).set(1 - used_ratio)
+        if reset_timestamp_seconds is not None:
+            if not 0 < reset_timestamp_seconds <= 253402300799:
+                raise ValueError("invalid OpenAI subscription reset timestamp")
+            self.ru_llm_proxy_openai_subscription_limit_reset_timestamp_seconds.labels(
+                profile=profile,
+                window=window,
+            ).set(reset_timestamp_seconds)
+        if window_seconds is not None:
+            if not 0 < window_seconds <= 10 * 365 * 24 * 60 * 60:
+                raise ValueError("invalid OpenAI subscription limit window")
+            self.ru_llm_proxy_openai_subscription_limit_window_seconds.labels(
+                profile=profile,
+                window=window,
+            ).set(window_seconds)
+        self.ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds.labels(
+            profile=profile,
+            window=window,
+        ).set(observed_at)
+
+    def increment_openai_subscription_failover(self, profile: str) -> None:
+        self._validate_openai_subscription_metric_labels(profile)
+        self.ru_llm_proxy_openai_subscription_failovers_total.labels(profile=profile).inc()
+
+    def increment_openai_subscription_auth_error(self, profile: str) -> None:
+        self._validate_openai_subscription_metric_labels(profile)
+        self.ru_llm_proxy_openai_subscription_auth_errors_total.labels(profile=profile).inc()
 
     def increment_callback_logging_failure(
         self,

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -17,6 +18,7 @@ from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileSelection,
     OpenAIProfileSelectionStatus,
     OpenAIProfileState,
+    OpenAIProfileStateSnapshot,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
     is_openai_subscription_terminal_routing_error,
@@ -963,3 +965,204 @@ async def test_stream_refreshes_only_after_final_success_event() -> None:
 
     await callback.async_log_success_event(kwargs, {"complete": True}, 0, 1)
     refresh.assert_awaited_once()
+
+
+def make_profile_state(state: OpenAIProfileState) -> OpenAIProfileStateSnapshot:
+    return OpenAIProfileStateSnapshot(
+        state=state,
+        reset_at=1700000100 if state in {OpenAIProfileState.COOLDOWN, OpenAIProfileState.HALF_OPEN} else None,
+        lease_expires_at=1700000050 if state is OpenAIProfileState.HALF_OPEN else None,
+        reason_code=None if state is OpenAIProfileState.AVAILABLE else "test_state",
+        updated_at=1700000000,
+        persisted=state is not OpenAIProfileState.AVAILABLE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_metrics_are_initialized_once_from_redis_state() -> None:
+    metrics_logger = MagicMock()
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
+    store.get_profile_state.side_effect = [
+        make_profile_state(OpenAIProfileState.AVAILABLE),
+        make_profile_state(OpenAIProfileState.DISABLED),
+    ]
+    store.select_available_profile.return_value = make_selection(PROFILE_ID)
+    deployments = [
+        make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
+        make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
+    ]
+
+    await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
+    await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
+
+    assert store.get_profile_state.await_count == 2
+    assert metrics_logger.initialize_openai_subscription_profile_metrics.call_args_list == [
+        call(profile=PROFILE_ID, available=True),
+        call(profile=SECOND_PROFILE_ID, available=False),
+    ]
+    assert metrics_logger.set_openai_subscription_profile_available.call_args_list == [
+        call(profile=PROFILE_ID, available=True),
+        call(profile=PROFILE_ID, available=True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recovery_probe_marks_profile_unavailable_in_metrics() -> None:
+    metrics_logger = MagicMock()
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
+    store.get_profile_state.side_effect = [
+        make_profile_state(OpenAIProfileState.HALF_OPEN),
+        make_profile_state(OpenAIProfileState.AVAILABLE),
+    ]
+    store.select_available_profile.return_value = make_probe_selection()
+    deployments = [
+        make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
+        make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
+    ]
+
+    await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
+
+    metrics_logger.set_openai_subscription_profile_available.assert_called_once_with(
+        profile=PROFILE_ID,
+        available=False,
+    )
+
+
+@pytest.mark.parametrize("response_shape", ["chat_completions", "responses_api"])
+@pytest.mark.asyncio
+async def test_success_observes_codex_limit_headers_for_both_api_shapes(
+    response_shape: str,
+) -> None:
+    metrics_logger = MagicMock()
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
+    store.refresh_profile_if_current.return_value = True
+    headers = {
+        "x-codex-primary-used-percent": "25",
+        "x-codex-primary-window-minutes": "300",
+        "x-codex-primary-reset-at": "1700000300",
+        "x-codex-secondary-used-percent": "75",
+    }
+    if response_shape == "chat_completions":
+        response_obj = SimpleNamespace(_response_headers=headers)
+    else:
+        response_obj = SimpleNamespace(_hidden_params={"headers": headers})
+
+    with patch(
+        "litellm.router_utils.pre_call_checks.openai_subscription_affinity_check.time.time",
+        return_value=1700000000.5,
+    ):
+        await callback.async_log_success_event(make_success_kwargs(), response_obj, 0, 1)
+
+    assert metrics_logger.observe_openai_subscription_limit_window.call_args_list == [
+        call(
+            profile=PROFILE_ID,
+            window="primary",
+            observed_at=1700000000.5,
+            used_ratio=0.25,
+            reset_timestamp_seconds=1700000300,
+            window_seconds=18000,
+        ),
+        call(
+            profile=PROFILE_ID,
+            window="secondary",
+            observed_at=1700000000.5,
+            used_ratio=0.75,
+            reset_timestamp_seconds=None,
+            window_seconds=None,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_failure_updates_limit_state_and_failover_metrics() -> None:
+    metrics_logger = MagicMock()
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
+    error = RuntimeError("provider body is not inspected")
+    error.status_code = 429  # type: ignore[attr-defined]
+    error.headers = {  # type: ignore[attr-defined]
+        "Retry-After": "120",
+        "x-codex-primary-used-percent": "100",
+        "x-codex-primary-reset-at": "1700000120",
+    }
+    store.fail_profile_if_current_binding.return_value = OpenAIProfileFailureUpdate(
+        status=OpenAIProfileFailureUpdateStatus.APPLIED,
+        effective_state=OpenAIProfileState.COOLDOWN,
+    )
+
+    with patch(
+        "litellm.router_utils.pre_call_checks.openai_subscription_affinity_check.time.time",
+        return_value=1700000000,
+    ):
+        await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+
+    metrics_logger.observe_openai_subscription_limit_window.assert_called_once_with(
+        profile=PROFILE_ID,
+        window="primary",
+        observed_at=1700000000,
+        used_ratio=1.0,
+        reset_timestamp_seconds=1700000120,
+        window_seconds=None,
+    )
+    metrics_logger.set_openai_subscription_profile_available.assert_called_once_with(
+        profile=PROFILE_ID,
+        available=False,
+    )
+    metrics_logger.increment_openai_subscription_failover.assert_called_once_with(profile=PROFILE_ID)
+    metrics_logger.increment_openai_subscription_auth_error.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_auth_failures_are_counted_but_only_applied_release_is_a_failover() -> None:
+    metrics_logger = MagicMock()
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
+    error = RuntimeError("provider body is not inspected")
+    error.status_code = 401  # type: ignore[attr-defined]
+    store.fail_profile_if_current_binding.side_effect = [
+        OpenAIProfileFailureUpdate(
+            status=OpenAIProfileFailureUpdateStatus.APPLIED,
+            effective_state=OpenAIProfileState.DISABLED,
+        ),
+        OpenAIProfileFailureUpdate(
+            status=OpenAIProfileFailureUpdateStatus.STALE,
+            effective_state=None,
+        ),
+    ]
+
+    await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+    await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+
+    assert metrics_logger.increment_openai_subscription_auth_error.call_count == 2
+    metrics_logger.increment_openai_subscription_failover.assert_called_once_with(profile=PROFILE_ID)
+    metrics_logger.set_openai_subscription_profile_available.assert_called_once_with(
+        profile=PROFILE_ID,
+        available=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_metrics_failures_do_not_change_routing_or_provider_result() -> None:
+    metrics_logger = MagicMock()
+    metrics_logger.initialize_openai_subscription_profile_metrics.side_effect = RuntimeError("metrics unavailable")
+    metrics_logger.observe_openai_subscription_limit_window.side_effect = RuntimeError("metrics unavailable")
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
+    store.get_profile_state.return_value = make_profile_state(OpenAIProfileState.AVAILABLE)
+    store.select_available_profile.return_value = make_selection(PROFILE_ID)
+    store.refresh_profile_if_current.return_value = True
+    deployments = [make_deployment("gpt-5.4", "deployment-a", PROFILE_ID)]
+
+    filtered = await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
+    await callback.async_log_success_event(
+        make_success_kwargs(),
+        SimpleNamespace(_response_headers={"x-codex-primary-used-percent": "50"}),
+        0,
+        1,
+    )
+
+    assert filtered == deployments
+    store.refresh_profile_if_current.assert_awaited_once()

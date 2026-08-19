@@ -273,6 +273,15 @@ DEFINED_PROMETHEUS_METRICS = Literal[
     # MCP tool call metrics
     "litellm_mcp_tool_calls_total",
     "litellm_mcp_tool_call_spend_metric",
+    # ru-llm-proxy OpenAI subscription pool metrics
+    "ru_llm_proxy_openai_subscription_available",
+    "ru_llm_proxy_openai_subscription_limit_used_ratio",
+    "ru_llm_proxy_openai_subscription_limit_remaining_ratio",
+    "ru_llm_proxy_openai_subscription_limit_reset_timestamp_seconds",
+    "ru_llm_proxy_openai_subscription_limit_window_seconds",
+    "ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds",
+    "ru_llm_proxy_openai_subscription_failovers_total",
+    "ru_llm_proxy_openai_subscription_auth_errors_total",
 ]
 
 
@@ -779,9 +788,20 @@ class PrometheusMetricLabels:
 
     litellm_mcp_tool_call_spend_metric: list[str] = list(litellm_mcp_tool_calls_total)
 
+    ru_llm_proxy_openai_subscription_available = ["profile"]
+    ru_llm_proxy_openai_subscription_limit_used_ratio = ["profile", "window"]
+    ru_llm_proxy_openai_subscription_limit_remaining_ratio = ["profile", "window"]
+    ru_llm_proxy_openai_subscription_limit_reset_timestamp_seconds = ["profile", "window"]
+    ru_llm_proxy_openai_subscription_limit_window_seconds = ["profile", "window"]
+    ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds = ["profile", "window"]
+    ru_llm_proxy_openai_subscription_failovers_total = ["profile"]
+    ru_llm_proxy_openai_subscription_auth_errors_total = ["profile"]
+
     @staticmethod
     def get_labels(label_name: DEFINED_PROMETHEUS_METRICS) -> list[str]:
         default_labels: Final = getattr(PrometheusMetricLabels, label_name)
+        if label_name.startswith("ru_llm_proxy_openai_subscription_"):
+            return list(default_labels)
         custom_labels: Final = []
 
         # Add custom metadata labels

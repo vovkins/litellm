@@ -18,6 +18,7 @@ from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileFailureUpdateStatus,
     OpenAIProfileHalfOpenLease,
+    OpenAIProfileProbeBindingAction,
     OpenAIProfileState,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
@@ -25,6 +26,9 @@ from litellm.router_utils.openai_subscription_affinity import (
 )
 from litellm.router_utils.openai_subscription_failure_classifier import (
     classify_openai_subscription_failure,
+)
+from litellm.router_utils.openai_subscription_metrics import (
+    extract_openai_subscription_limit_observations,
 )
 from litellm.types.llms.openai import AllMessageValues
 
@@ -54,10 +58,12 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         ttl_seconds: int = OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
         half_open_lease_seconds: int = OpenAISubscriptionAffinityStore.DEFAULT_HALF_OPEN_LEASE_SECONDS,
         router: Any | None = None,
+        metrics_logger: Any | None = None,
     ) -> None:
         self.store = store
         self.ttl_seconds = ttl_seconds
         self.router = router
+        self.metrics_logger = metrics_logger
         if (
             not isinstance(half_open_lease_seconds, int)
             or isinstance(half_open_lease_seconds, bool)
@@ -68,6 +74,9 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         self.half_open_lease_seconds = half_open_lease_seconds
         self._probe_contexts: dict[str, _HalfOpenProbeContext] = {}
         self._probe_contexts_lock = threading.Lock()
+        self._metrics_profiles: set[str] = set()
+        self._metrics_logger_identity: int | None = None
+        self._metrics_lock = threading.Lock()
 
     async def async_filter_deployments(
         self,
@@ -101,6 +110,8 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         if has_unmarked_deployments:
             verbose_router_logger.error("OpenAI subscription affinity found a mixed OAuth/non-OAuth model group")
             raise self._service_unavailable(model)
+
+        await self._initialize_profile_metrics(configured_profile_ids)
 
         user_api_key_hash: Final = self._get_request_user_api_key_hash(request_context)
         if user_api_key_hash is None:
@@ -168,7 +179,9 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
 
         lease: Final = selection.half_open_lease
         if lease is None:
+            self._set_profile_available_metric(selected_profile, True)
             return [self._copy_deployment_with_probe_handle(deployment, None) for deployment in selected_deployments]
+        self._set_profile_available_metric(selected_profile, False)
         probe_handle: Final = self._remember_probe_context(
             user_api_key_hash=user_api_key_hash,
             lease=lease,
@@ -182,6 +195,12 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         profile_id: Final = self._get_selected_profile_id(kwargs)
         if user_api_key_hash is None or profile_id is None:
             return
+
+        self._observe_limit_metrics(
+            profile_id=profile_id,
+            kwargs=kwargs,
+            response_obj=response_obj,
+        )
 
         probe_handle: Final = self._get_selected_probe_handle(kwargs)
         if probe_handle is not None:
@@ -209,14 +228,18 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
                 return
             if not completion.applied:
                 verbose_router_logger.debug("OpenAI subscription affinity ignored a stale successful recovery probe")
+            else:
+                self._set_profile_available_metric(profile_id, True)
             return
 
         try:
-            await self.store.refresh_profile_if_current(
+            refreshed: Final = await self.store.refresh_profile_if_current(
                 user_api_key_hash=user_api_key_hash,
                 profile_id=profile_id,
                 ttl_seconds=self.ttl_seconds,
             )
+            if refreshed:
+                self._set_profile_available_metric(profile_id, True)
         except (OpenAISubscriptionAffinityStoreError, ValueError):
             # The provider response has already succeeded; affinity maintenance
             # must not turn that response into a client-visible failure.
@@ -239,6 +262,15 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
                 "OpenAI subscription affinity could not attribute a profile-scoped failure to trusted routing metadata"
             )
             return
+
+        self._observe_limit_metrics(
+            profile_id=profile_id,
+            kwargs=kwargs,
+            response_obj=response_obj,
+            error=error,
+        )
+        if classification.reason_code == "oauth_error":
+            self._increment_auth_error_metric(profile_id)
 
         probe_handle: Final = self._get_selected_probe_handle(kwargs)
         if probe_handle is not None:
@@ -271,6 +303,10 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
                 return
             if not completion.applied:
                 verbose_router_logger.debug("OpenAI subscription affinity ignored a stale failed recovery probe")
+            else:
+                self._set_profile_available_metric(profile_id, False)
+                if completion.binding_action is OpenAIProfileProbeBindingAction.RELEASED:
+                    self._increment_failover_metric(profile_id)
             return
 
         if not classification.failover_eligible or target_state is None:
@@ -290,6 +326,118 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
 
         if update.status is OpenAIProfileFailureUpdateStatus.STALE:
             verbose_router_logger.debug("OpenAI subscription affinity ignored a stale profile-scoped failure")
+        else:
+            self._set_profile_available_metric(profile_id, False)
+            self._increment_failover_metric(profile_id)
+
+    async def _initialize_profile_metrics(self, profile_ids: list[str]) -> None:
+        metrics_logger: Final = self._get_metrics_logger()
+        if metrics_logger is None:
+            return
+        logger_identity: Final = id(metrics_logger)
+        with self._metrics_lock:
+            if self._metrics_logger_identity != logger_identity:
+                self._metrics_logger_identity = logger_identity
+                self._metrics_profiles.clear()
+            missing_profiles: Final = [
+                profile_id for profile_id in dict.fromkeys(profile_ids) if profile_id not in self._metrics_profiles
+            ]
+
+        for profile_id in missing_profiles:
+            try:
+                snapshot: Final = await self.store.get_profile_state(profile_id)
+            except (OpenAISubscriptionAffinityStoreError, ValueError):
+                verbose_router_logger.error("OpenAI subscription metrics could not read shared profile state")
+                continue
+            if not self._call_metrics_logger(
+                metrics_logger,
+                "initialize_openai_subscription_profile_metrics",
+                profile=profile_id,
+                available=snapshot.state is OpenAIProfileState.AVAILABLE,
+            ):
+                continue
+            with self._metrics_lock:
+                if self._metrics_logger_identity == logger_identity:
+                    self._metrics_profiles.add(profile_id)
+
+    def _observe_limit_metrics(
+        self,
+        *,
+        profile_id: str,
+        kwargs: Mapping[str, Any],
+        response_obj: object,
+        error: BaseException | None = None,
+    ) -> None:
+        observations: Final = extract_openai_subscription_limit_observations(
+            kwargs=kwargs,
+            response_obj=response_obj,
+            error=error,
+        )
+        if not observations:
+            return
+        metrics_logger: Final = self._get_metrics_logger()
+        if metrics_logger is None:
+            return
+        observed_at: Final = time.time()
+        for observation in observations:
+            self._call_metrics_logger(
+                metrics_logger,
+                "observe_openai_subscription_limit_window",
+                profile=profile_id,
+                window=observation.window,
+                observed_at=observed_at,
+                used_ratio=observation.used_ratio,
+                reset_timestamp_seconds=observation.reset_timestamp_seconds,
+                window_seconds=observation.window_seconds,
+            )
+
+    def _set_profile_available_metric(self, profile_id: str, available: bool) -> None:
+        metrics_logger: Final = self._get_metrics_logger()
+        if metrics_logger is not None:
+            self._call_metrics_logger(
+                metrics_logger,
+                "set_openai_subscription_profile_available",
+                profile=profile_id,
+                available=available,
+            )
+
+    def _increment_failover_metric(self, profile_id: str) -> None:
+        metrics_logger: Final = self._get_metrics_logger()
+        if metrics_logger is not None:
+            self._call_metrics_logger(
+                metrics_logger,
+                "increment_openai_subscription_failover",
+                profile=profile_id,
+            )
+
+    def _increment_auth_error_metric(self, profile_id: str) -> None:
+        metrics_logger: Final = self._get_metrics_logger()
+        if metrics_logger is not None:
+            self._call_metrics_logger(
+                metrics_logger,
+                "increment_openai_subscription_auth_error",
+                profile=profile_id,
+            )
+
+    def _get_metrics_logger(self) -> Any | None:
+        if self.metrics_logger is not None:
+            return self.metrics_logger
+        try:
+            from litellm.router_utils.cooldown_callbacks import _get_prometheus_logger_from_callbacks
+
+            return _get_prometheus_logger_from_callbacks()
+        except Exception:
+            verbose_router_logger.error("OpenAI subscription metrics could not find the Prometheus callback")
+            return None
+
+    @staticmethod
+    def _call_metrics_logger(metrics_logger: Any, method_name: str, **kwargs: object) -> bool:
+        try:
+            getattr(metrics_logger, method_name)(**kwargs)
+        except Exception:
+            verbose_router_logger.error("OpenAI subscription metrics update failed")
+            return False
+        return True
 
     def _remember_probe_context(
         self,
