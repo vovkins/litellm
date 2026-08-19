@@ -9,7 +9,7 @@ on:
       version:
         description: "Immutable image version, for example 1.97.0-multi-oauth.4"
         required: true
-        default: "1.97.0-multi-oauth.4"
+        default: "1.97.0-multi-oauth.7"
         type: string
       commit_sha:
         description: "Full 40-character commit SHA to build"
@@ -46,7 +46,8 @@ jobs:
       - name: Check out the requested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          # The fork is intentionally shallow; this still includes the pinned upstream commit.
+          fetch-depth: 100
           persist-credentials: false
           ref: ${{ inputs.commit_sha || github.sha }}
 
