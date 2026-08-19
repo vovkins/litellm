@@ -9,7 +9,7 @@ on:
       version:
         description: "Immutable image version, for example 1.97.0-multi-oauth.4"
         required: true
-        default: "1.97.0-multi-oauth.7"
+        default: "1.97.0-multi-oauth.8"
         type: string
       commit_sha:
         description: "Full 40-character commit SHA to build"
@@ -46,8 +46,7 @@ jobs:
       - name: Check out the requested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The fork is intentionally shallow; this still includes the pinned upstream commit.
-          fetch-depth: 100
+          fetch-depth: 1
           persist-credentials: false
           ref: ${{ inputs.commit_sha || github.sha }}
 
@@ -57,6 +56,7 @@ jobs:
           DISPATCH_COMMIT_SHA: ${{ inputs.commit_sha }}
           DISPATCH_VERSION: ${{ inputs.version }}
           EVENT_NAME: ${{ github.event_name }}
+          GITHUB_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
@@ -82,7 +82,17 @@ jobs:
             echo "::error::checked-out commit does not match commit_sha"
             exit 1
           fi
-          if ! git merge-base --is-ancestor "${UPSTREAM_SHA}" "${commit_sha}"; then
+          comparison="$(
+            curl --fail --silent --show-error --retry 3 \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/compare/${UPSTREAM_SHA}...${commit_sha}"
+          )"
+          comparison_status="$(jq --raw-output '.status' <<< "${comparison}")"
+          merge_base_sha="$(jq --raw-output '.merge_base_commit.sha' <<< "${comparison}")"
+          if [[ "${merge_base_sha}" != "${UPSTREAM_SHA}" ]] || \
+             [[ "${comparison_status}" != "ahead" && "${comparison_status}" != "identical" ]]; then
             echo "::error::commit is not based on the pinned LiteLLM upstream SHA"
             exit 1
           fi
