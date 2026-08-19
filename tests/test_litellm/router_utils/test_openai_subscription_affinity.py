@@ -7,6 +7,7 @@ import pytest
 
 from litellm.caching.dual_cache import DualCache
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileAvailability,
     OpenAIProfileFailureUpdateStatus,
     OpenAIProfileHalfOpenLease,
     OpenAIProfileProbeBindingAction,
@@ -268,6 +269,7 @@ async def test_select_available_profile_returns_typed_unavailable_summary() -> N
             b"0",
             b"1",
             b"1700000100",
+            b"100",
         ]
     )
 
@@ -283,11 +285,52 @@ async def test_select_available_profile_returns_typed_unavailable_summary() -> N
     assert selection.half_open_profiles == 0
     assert selection.disabled_profiles == 1
     assert selection.next_recovery_at == 1700000100
+    assert selection.retry_after_seconds == 100
+
+
+@pytest.mark.asyncio
+async def test_inspect_profile_availability_returns_typed_full_pool_summary() -> None:
+    store, script = make_store([b"0", b"1", b"0", b"1", b"1700000100", b"100"])
+
+    availability = await store.inspect_profile_availability(
+        ["subscription-b", "subscription-a"],
+    )
+
+    assert availability == OpenAIProfileAvailability(
+        available_profiles=0,
+        cooldown_profiles=1,
+        half_open_profiles=0,
+        disabled_profiles=1,
+        next_recovery_at=1700000100,
+        retry_after_seconds=100,
+    )
+    script.assert_awaited_once_with(
+        keys=(SUBSCRIPTION_A_STATE_KEY, SUBSCRIPTION_B_STATE_KEY),
+        args=("2", "subscription-a", "subscription-b"),
+        client=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        [b"invalid_state"],
+        [b"0", b"1", b"0", b"0", b"1700000100", b"100"],
+        [b"0", b"1", b"0", b"1", b"", b""],
+        [b"0", b"1", b"0", b"1", b"1700000100", b"0"],
+    ],
+)
+@pytest.mark.asyncio
+async def test_inspect_profile_availability_rejects_invalid_result(response: object) -> None:
+    store, _ = make_store(response)
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await store.inspect_profile_availability(["subscription-a", "subscription-b"])
 
 
 @pytest.mark.asyncio
 async def test_get_or_assign_profile_raises_typed_error_when_all_profiles_are_unavailable() -> None:
-    store, _ = make_store([b"unavailable", b"", b"-2", b"0", b"0", b"2", b""])
+    store, _ = make_store([b"unavailable", b"", b"-2", b"0", b"0", b"2", b"", b""])
 
     with pytest.raises(OpenAISubscriptionNoAvailableProfilesError) as exc_info:
         await store.get_or_assign_profile(
@@ -304,9 +347,11 @@ async def test_get_or_assign_profile_raises_typed_error_when_all_profiles_are_un
     [
         [b"invalid_state"],
         [b"invalid_binding"],
-        [b"unavailable", b"", b"-2", b"1", b"0", b"0", b""],
-        [b"unavailable", b"", b"60", b"0", b"0", b"2", b""],
-        [b"unavailable", b"subscription-a", b"60", b"1", b"0", b"1", b""],
+        [b"unavailable", b"", b"-2", b"1", b"0", b"0", b"", b""],
+        [b"unavailable", b"", b"60", b"0", b"0", b"2", b"", b""],
+        [b"unavailable", b"subscription-a", b"60", b"1", b"0", b"1", b"", b""],
+        [b"unavailable", b"", b"-2", b"1", b"0", b"0", b"1700000100", b"0"],
+        [b"unavailable", b"", b"-2", b"1", b"0", b"0", b"1700000100", b"604801"],
         [b"assigned", b"not-in-pool", b"60"],
     ],
 )

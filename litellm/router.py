@@ -136,6 +136,7 @@ from litellm.router_utils.handle_error import (
 from litellm.router_utils.health_state_cache import DeploymentHealthCache
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAISubscriptionAffinityStore,
+    is_openai_subscription_terminal_routing_error,
 )
 from litellm.router_utils.pre_call_checks.deployment_affinity_check import (
     DeploymentAffinityCheck,
@@ -1704,6 +1705,7 @@ class Router:
                 openai_affinity: Final = OpenAISubscriptionAffinityCheck(
                     store=OpenAISubscriptionAffinityStore(cache=self.cache),
                     ttl_seconds=self.deployment_affinity_ttl_seconds,
+                    router=self,
                 )
                 self.optional_callbacks.append(openai_affinity)
                 litellm.logging_callback_manager.add_litellm_callback(openai_affinity)
@@ -6198,6 +6200,8 @@ class Router:
         if verbose_router_logger.isEnabledFor(logging.DEBUG):
             verbose_router_logger.debug("Traceback%s", redact_string(traceback.format_exc()))
         original_exception: Final = e
+        if is_openai_subscription_terminal_routing_error(e):
+            raise e
         fallback_model_group = None
         original_model_group: Final[str | None] = kwargs.get("model")
         fallback_failure_exception_str = ""
@@ -6565,6 +6569,8 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
+            if is_openai_subscription_terminal_routing_error(e):
+                raise
             current_attempt = None
             original_exception = e
             deployment_num_retries: Final = getattr(e, "num_retries", None)

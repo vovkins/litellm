@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import litellm
-from litellm.exceptions import ServiceUnavailableError
+from litellm.exceptions import RateLimitError, ServiceUnavailableError
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileAvailability,
     OpenAIProfileFailureUpdate,
     OpenAIProfileFailureUpdateStatus,
     OpenAIProfileHalfOpenLease,
@@ -18,6 +19,7 @@ from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileState,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
+    is_openai_subscription_terminal_routing_error,
 )
 from litellm.router_utils.pre_call_checks.openai_subscription_affinity_check import (
     OpenAISubscriptionAffinityCheck,
@@ -35,9 +37,9 @@ def make_callback() -> tuple[OpenAISubscriptionAffinityCheck, AsyncMock]:
     return callback, refresh
 
 
-def make_routing_callback() -> tuple[OpenAISubscriptionAffinityCheck, MagicMock]:
+def make_routing_callback(router: object | None = None) -> tuple[OpenAISubscriptionAffinityCheck, MagicMock]:
     store = MagicMock(spec=OpenAISubscriptionAffinityStore)
-    callback = OpenAISubscriptionAffinityCheck(store=store)
+    callback = OpenAISubscriptionAffinityCheck(store=store, router=router)
     return callback, store
 
 
@@ -273,16 +275,81 @@ async def test_unhealthy_bound_profile_does_not_fall_back_randomly() -> None:
         await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
 
 
+@pytest.mark.parametrize(
+    ("cooldown_profiles", "half_open_profiles", "disabled_profiles"),
+    [
+        (1, 0, 1),
+        (0, 1, 1),
+    ],
+)
 @pytest.mark.asyncio
-async def test_no_available_profile_returns_neutral_503() -> None:
+async def test_recoverable_pool_returns_neutral_429_with_retry_after(
+    cooldown_profiles: int,
+    half_open_profiles: int,
+    disabled_profiles: int,
+) -> None:
     callback, store = make_routing_callback()
     store.select_available_profile.return_value = OpenAIProfileSelection(
         status=OpenAIProfileSelectionStatus.UNAVAILABLE,
         profile_id=None,
         remaining_ttl_seconds=60,
-        cooldown_profiles=1,
-        disabled_profiles=1,
+        cooldown_profiles=cooldown_profiles,
+        half_open_profiles=half_open_profiles,
+        disabled_profiles=disabled_profiles,
         next_recovery_at=1700000100,
+        retry_after_seconds=75,
+    )
+    deployments = [
+        make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
+        make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
+    ]
+
+    with pytest.raises(RateLimitError) as exc_info:
+        await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
+
+    error = exc_info.value
+    assert error.status_code == 429
+    assert error.headers == {"retry-after": "75"}
+    assert error.response.headers["retry-after"] == "75"
+    assert is_openai_subscription_terminal_routing_error(error) is True
+    assert PROFILE_ID not in str(error)
+    assert SECOND_PROFILE_ID not in str(error)
+    assert USER_KEY_HASH not in str(error)
+
+
+@pytest.mark.asyncio
+async def test_pool_retry_after_survives_proxy_exception_serialization() -> None:
+    from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+
+    callback, _ = make_routing_callback()
+    error = callback._rate_limited(model="public-model", retry_after_seconds=37)
+    processor = ProxyBaseLLMRequestProcessing(data={})
+    proxy_logging_obj = MagicMock()
+    proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+    proxy_logging_obj.post_call_response_headers_hook = AsyncMock(return_value={})
+
+    with pytest.raises(ProxyException) as exc_info:
+        await processor._handle_llm_api_exception(
+            e=error,
+            user_api_key_dict=UserAPIKeyAuth(api_key="sk-test"),
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+    proxy_error = exc_info.value
+    assert proxy_error.code == "429"
+    assert proxy_error.headers["retry-after"] == "37"
+    assert "public-model" not in proxy_error.message
+
+
+@pytest.mark.asyncio
+async def test_fully_disabled_pool_returns_neutral_terminal_503() -> None:
+    callback, store = make_routing_callback()
+    store.select_available_profile.return_value = OpenAIProfileSelection(
+        status=OpenAIProfileSelectionStatus.UNAVAILABLE,
+        profile_id=None,
+        remaining_ttl_seconds=None,
+        disabled_profiles=2,
     )
     deployments = [
         make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
@@ -292,9 +359,103 @@ async def test_no_available_profile_returns_neutral_503() -> None:
     with pytest.raises(ServiceUnavailableError) as exc_info:
         await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
 
-    assert exc_info.value.status_code == 503
+    error = exc_info.value
+    assert error.status_code == 503
+    assert is_openai_subscription_terminal_routing_error(error) is True
+    assert PROFILE_ID not in str(error)
+    assert SECOND_PROFILE_ID not in str(error)
+    assert USER_KEY_HASH not in str(error)
+
+
+@pytest.mark.asyncio
+async def test_empty_router_healthy_set_uses_configured_oauth_pool_for_safe_error() -> None:
+    router = MagicMock()
+    router.get_model_list.return_value = [
+        make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
+        make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
+    ]
+    callback, store = make_routing_callback(router=router)
+    store.select_available_profile.return_value = OpenAIProfileSelection(
+        status=OpenAIProfileSelectionStatus.UNAVAILABLE,
+        profile_id=None,
+        remaining_ttl_seconds=None,
+        cooldown_profiles=2,
+        next_recovery_at=1700000100,
+        retry_after_seconds=30,
+    )
+
+    with pytest.raises(RateLimitError) as exc_info:
+        await callback.async_filter_deployments(
+            "gpt-5.4",
+            [],
+            None,
+            {
+                "metadata": {
+                    "user_api_key_hash": USER_KEY_HASH,
+                    "user_api_key_team_id": "team-a",
+                }
+            },
+        )
+
+    assert exc_info.value.headers == {"retry-after": "30"}
+    router.get_model_list.assert_called_once_with(model_name="gpt-5.4", team_id="team-a")
+    store.select_available_profile.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        available_profile_ids=[PROFILE_ID, SECOND_PROFILE_ID],
+        ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
+        allow_recovery_probe=True,
+        half_open_lease_seconds=OpenAISubscriptionAffinityStore.DEFAULT_HALF_OPEN_LEASE_SECONDS,
+    )
+
+
+@pytest.mark.parametrize("configured_available_profiles", [0, 1])
+@pytest.mark.asyncio
+async def test_error_policy_inspects_profiles_filtered_by_router_cooldown(
+    configured_available_profiles: int,
+) -> None:
+    router = MagicMock()
+    router.get_model_list.return_value = [
+        make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
+        make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
+    ]
+    callback, store = make_routing_callback(router=router)
+    store.select_available_profile.return_value = OpenAIProfileSelection(
+        status=OpenAIProfileSelectionStatus.UNAVAILABLE,
+        profile_id=None,
+        remaining_ttl_seconds=None,
+        disabled_profiles=1,
+    )
+    store.inspect_profile_availability.return_value = OpenAIProfileAvailability(
+        available_profiles=configured_available_profiles,
+        cooldown_profiles=1 - configured_available_profiles,
+        half_open_profiles=0,
+        disabled_profiles=1,
+        next_recovery_at=1700000100 if configured_available_profiles == 0 else None,
+        retry_after_seconds=50 if configured_available_profiles == 0 else None,
+    )
+    healthy_deployments = [make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID)]
+
+    expected_error = RateLimitError if configured_available_profiles == 0 else ServiceUnavailableError
+    with pytest.raises(expected_error) as exc_info:
+        await callback.async_filter_deployments(
+            "gpt-5.4",
+            healthy_deployments,
+            None,
+            make_request_kwargs(),
+        )
+
+    if configured_available_profiles == 0:
+        assert exc_info.value.headers == {"retry-after": "50"}
     assert PROFILE_ID not in str(exc_info.value)
     assert SECOND_PROFILE_ID not in str(exc_info.value)
+    store.select_available_profile.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        available_profile_ids=[SECOND_PROFILE_ID],
+        ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
+        allow_recovery_probe=True,
+        half_open_lease_seconds=OpenAISubscriptionAffinityStore.DEFAULT_HALF_OPEN_LEASE_SECONDS,
+    )
+    store.inspect_profile_availability.assert_awaited_once_with([PROFILE_ID, SECOND_PROFILE_ID])
 
 
 @pytest.mark.asyncio
@@ -327,6 +488,7 @@ async def test_router_registers_and_separates_openai_and_glm_affinity() -> None:
         assert len(openai_callbacks) == 1
         assert callbacks.index(openai_callbacks[0]) < callbacks.index(deployment_callback)
         assert litellm.callbacks.index(openai_callbacks[0]) < litellm.callbacks.index(deployment_callback)
+        assert openai_callbacks[0].router is router
         assert deployment_callback.enable_user_key_affinity is False
         assert deployment_callback._get_effective_flags("glm-5.2") == (True, False, False)
         assert deployment_callback._get_effective_flags("gpt-5.4") == (False, False, False)
@@ -360,6 +522,68 @@ async def test_router_registers_and_separates_openai_and_glm_affinity() -> None:
         assert filtered_oauth == [oauth_deployments[1]]
         assert filtered_glm == glm_deployments
         openai_callback.store.select_available_profile.assert_awaited_once()
+    finally:
+        if router is not None:
+            router.discard()
+        litellm.callbacks = original_callbacks
+
+
+@pytest.mark.parametrize("api_kind", ["chat_completions", "responses"])
+@pytest.mark.asyncio
+async def test_pool_exhaustion_bypasses_router_retries_and_fallbacks(api_kind: str) -> None:
+    original_callbacks = list(litellm.callbacks)
+    litellm.callbacks = []
+    router = None
+    provider_function = "acompletion" if api_kind == "chat_completions" else "aresponses"
+    try:
+        with patch.object(litellm, provider_function, new_callable=AsyncMock) as provider_call:
+            model_list = [
+                make_deployment("gpt-5.4", "oauth-a", PROFILE_ID),
+                make_deployment("gpt-5.4", "oauth-b", SECOND_PROFILE_ID),
+                make_deployment("fallback-model", "fallback"),
+            ]
+            for deployment in model_list:
+                deployment["litellm_params"] = {
+                    "model": "openai/gpt-4",
+                    "api_key": "sk-test",
+                }
+            router = litellm.Router(
+                model_list=model_list,
+                optional_pre_call_checks=["openai_subscription_affinity"],
+                num_retries=3,
+                fallbacks=[{"gpt-5.4": ["fallback-model"]}],
+            )
+            callback = next(
+                item for item in (router.optional_callbacks or []) if isinstance(item, OpenAISubscriptionAffinityCheck)
+            )
+            callback.store.select_available_profile = AsyncMock(
+                return_value=OpenAIProfileSelection(
+                    status=OpenAIProfileSelectionStatus.UNAVAILABLE,
+                    profile_id=None,
+                    remaining_ttl_seconds=None,
+                    cooldown_profiles=2,
+                    next_recovery_at=1700000100,
+                    retry_after_seconds=45,
+                )
+            )
+            common_kwargs = {
+                "model": "gpt-5.4",
+                "metadata": {"user_api_key_hash": USER_KEY_HASH},
+                "num_retries": 3,
+            }
+
+            with pytest.raises(RateLimitError) as exc_info:
+                if api_kind == "chat_completions":
+                    await router.acompletion(
+                        messages=[{"role": "user", "content": "hello"}],
+                        **common_kwargs,
+                    )
+                else:
+                    await router.aresponses(input="hello", **common_kwargs)
+
+            assert exc_info.value.headers == {"retry-after": "45"}
+            assert callback.store.select_available_profile.await_count == 1
+            provider_call.assert_not_awaited()
     finally:
         if router is not None:
             router.discard()

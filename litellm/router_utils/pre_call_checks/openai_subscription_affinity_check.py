@@ -10,8 +10,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, cast
 
+import httpx
+
 from litellm._logging import verbose_router_logger
-from litellm.exceptions import ServiceUnavailableError
+from litellm.exceptions import RateLimitError, ServiceUnavailableError
 from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileFailureUpdateStatus,
@@ -19,6 +21,7 @@ from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileState,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
+    mark_openai_subscription_terminal_routing_error,
 )
 from litellm.router_utils.openai_subscription_failure_classifier import (
     classify_openai_subscription_failure,
@@ -50,9 +53,11 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         store: OpenAISubscriptionAffinityStore,
         ttl_seconds: int = OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
         half_open_lease_seconds: int = OpenAISubscriptionAffinityStore.DEFAULT_HALF_OPEN_LEASE_SECONDS,
+        router: Any | None = None,
     ) -> None:
         self.store = store
         self.ttl_seconds = ttl_seconds
+        self.router = router
         if (
             not isinstance(half_open_lease_seconds, int)
             or isinstance(half_open_lease_seconds, bool)
@@ -73,8 +78,21 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         parent_otel_span: Span | None = None,
     ) -> list[dict]:
         deployments: Final = cast(list[dict], healthy_deployments)
+        request_context: Final = request_kwargs or {}
         try:
             profile_ids, has_unmarked_deployments = self._get_available_profile_ids(deployments)
+            configured_deployments: Final = self._get_configured_deployments(
+                model=model,
+                request_kwargs=request_context,
+            )
+            configured_profile_ids, configured_has_unmarked = self._get_available_profile_ids(configured_deployments)
+            if configured_profile_ids:
+                if configured_has_unmarked:
+                    has_unmarked_deployments = True
+                if not profile_ids:
+                    profile_ids = configured_profile_ids
+            else:
+                configured_profile_ids = profile_ids
         except ValueError:
             verbose_router_logger.error("OpenAI subscription affinity found an invalid profile marker")
             raise self._service_unavailable(model) from None
@@ -84,7 +102,7 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
             verbose_router_logger.error("OpenAI subscription affinity found a mixed OAuth/non-OAuth model group")
             raise self._service_unavailable(model)
 
-        user_api_key_hash: Final = self._get_request_user_api_key_hash(request_kwargs or {})
+        user_api_key_hash: Final = self._get_request_user_api_key_hash(request_context)
         if user_api_key_hash is None:
             verbose_router_logger.error("OpenAI subscription affinity requires an authenticated virtual-key hash")
             raise self._service_unavailable(model)
@@ -102,13 +120,41 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
             raise self._service_unavailable(model) from None
         selected_profile: Final = selection.profile_id
         if selected_profile is None:
+            available_profiles = 0
+            cooldown_profiles = selection.cooldown_profiles
+            half_open_profiles = selection.half_open_profiles
+            disabled_profiles = selection.disabled_profiles
+            retry_after_seconds = selection.retry_after_seconds
+            if set(configured_profile_ids) != set(profile_ids):
+                try:
+                    availability: Final = await self.store.inspect_profile_availability(configured_profile_ids)
+                except (OpenAISubscriptionAffinityStoreError, ValueError):
+                    verbose_router_logger.error(
+                        "OpenAI subscription affinity could not inspect shared pool availability"
+                    )
+                    raise self._service_unavailable(model) from None
+                available_profiles = availability.available_profiles
+                cooldown_profiles = availability.cooldown_profiles
+                half_open_profiles = availability.half_open_profiles
+                disabled_profiles = availability.disabled_profiles
+                retry_after_seconds = availability.retry_after_seconds
             verbose_router_logger.error(
                 "OpenAI subscription affinity found no profile eligible for normal traffic "
-                "(cooldown=%s, half_open=%s, disabled=%s)",
-                selection.cooldown_profiles,
-                selection.half_open_profiles,
-                selection.disabled_profiles,
+                "(available=%s, cooldown=%s, half_open=%s, disabled=%s)",
+                available_profiles,
+                cooldown_profiles,
+                half_open_profiles,
+                disabled_profiles,
             )
+            if (
+                available_profiles == 0
+                and cooldown_profiles + half_open_profiles > 0
+                and retry_after_seconds is not None
+            ):
+                raise self._rate_limited(
+                    model=model,
+                    retry_after_seconds=retry_after_seconds,
+                )
             raise self._service_unavailable(model)
 
         selected_deployments: Final = [
@@ -328,6 +374,32 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
             profile_ids.append(profile_id)
         return profile_ids, has_unmarked_deployments
 
+    def _get_configured_deployments(
+        self,
+        *,
+        model: str,
+        request_kwargs: Mapping[str, Any],
+    ) -> list[dict]:
+        if self.router is None:
+            return []
+        team_id: str | None = None
+        for metadata_key in ("metadata", "litellm_metadata"):
+            metadata: Final = request_kwargs.get(metadata_key)
+            if isinstance(metadata, Mapping):
+                candidate_team_id: Final = metadata.get("user_api_key_team_id")
+                if isinstance(candidate_team_id, str):
+                    team_id = candidate_team_id
+                    break
+        try:
+            configured: Final = self.router.get_model_list(model_name=model, team_id=team_id)
+        except Exception as exc:
+            raise ValueError("could not inspect configured OpenAI subscription deployments") from exc
+        if configured is None:
+            return []
+        if not isinstance(configured, list) or any(not isinstance(deployment, dict) for deployment in configured):
+            raise ValueError("configured OpenAI subscription deployments have an invalid shape")
+        return cast(list[dict], configured)
+
     @staticmethod
     def _get_deployment_profile_id(deployment: Mapping[str, Any]) -> str | None:
         model_info: Final = deployment.get("model_info")
@@ -338,11 +410,39 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
 
     @staticmethod
     def _service_unavailable(model: str) -> ServiceUnavailableError:
-        return ServiceUnavailableError(
+        error: Final = ServiceUnavailableError(
             message="The requested model is temporarily unavailable. Retry later.",
             llm_provider="",
             model=model,
+            num_retries=0,
         )
+        mark_openai_subscription_terminal_routing_error(error)
+        return error
+
+    @staticmethod
+    def _rate_limited(model: str, retry_after_seconds: int) -> RateLimitError:
+        retry_after: Final = max(
+            1,
+            min(
+                retry_after_seconds,
+                OpenAISubscriptionAffinityStore.MAX_RECOVERY_RETRY_AFTER_SECONDS,
+            ),
+        )
+        headers: Final = {"retry-after": str(retry_after)}
+        error: Final = RateLimitError(
+            message="The requested model is temporarily rate-limited. Retry later.",
+            llm_provider="",
+            model=model,
+            num_retries=0,
+            headers=headers,
+            response=httpx.Response(
+                status_code=429,
+                headers=headers,
+                request=httpx.Request("POST", "https://litellm.invalid/"),
+            ),
+        )
+        mark_openai_subscription_terminal_routing_error(error)
+        return error
 
     @staticmethod
     def _get_selected_profile_id(kwargs: Mapping[str, Any]) -> str | None:

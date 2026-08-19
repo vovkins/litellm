@@ -15,6 +15,19 @@ from typing import Any, Final, Protocol, cast
 
 from litellm.caching.dual_cache import DualCache
 
+_TERMINAL_ROUTING_ERROR_ATTRIBUTE: Final = "_litellm_openai_subscription_terminal_routing_error"
+
+
+def mark_openai_subscription_terminal_routing_error(error: Exception) -> None:
+    """Prevent a final pool decision from entering Router retry/fallback paths."""
+
+    setattr(error, _TERMINAL_ROUTING_ERROR_ATTRIBUTE, True)
+
+
+def is_openai_subscription_terminal_routing_error(error: BaseException) -> bool:
+    return getattr(error, _TERMINAL_ROUTING_ERROR_ATTRIBUTE, False) is True
+
+
 _AFFINITY_STORE_SCRIPT: Final = """
 local operation = ARGV[1]
 
@@ -243,6 +256,15 @@ end
 
 if #eligible == 0 then
   local current_value = current == false and '' or current
+  local retry_after = nil
+  if next_recovery_at ~= nil then
+    retry_after = next_recovery_at - now
+    if retry_after < 1 then
+      retry_after = 1
+    elseif retry_after > 604800 then
+      retry_after = 604800
+    end
+  end
   return {
     'unavailable',
     current_value,
@@ -250,7 +272,8 @@ if #eligible == 0 then
     tostring(cooldown_count),
     tostring(half_open_count),
     tostring(disabled_count),
-    next_recovery_at == nil and '' or tostring(next_recovery_at)
+    next_recovery_at == nil and '' or tostring(next_recovery_at),
+    retry_after == nil and '' or tostring(retry_after)
   }
 end
 
@@ -258,6 +281,69 @@ local sequence = redis.call('INCR', KEYS[2])
 local selected_profile = eligible[((sequence - 1) % #eligible) + 1]
 redis.call('SET', KEYS[1], selected_profile, 'EX', ttl)
 return {current == false and 'assigned' or 'reassigned', selected_profile, tostring(ttl)}
+"""
+)
+
+_PROFILE_AVAILABILITY_SCRIPT: Final = (
+    _PROFILE_STATE_VALIDATION_LUA
+    + """
+local profile_count = tonumber(ARGV[1])
+if profile_count == nil or profile_count <= 0 or #KEYS ~= profile_count or #ARGV ~= profile_count + 1 then
+  return redis.error_reply('invalid profile availability shape')
+end
+
+local available_count = 0
+local cooldown_count = 0
+local half_open_count = 0
+local disabled_count = 0
+local next_recovery_at = nil
+local now = tonumber(redis.call('TIME')[1])
+
+for index = 1, profile_count do
+  local profile_id = ARGV[index + 1]
+  if not is_profile_id(profile_id) then
+    return redis.error_reply('invalid availability profile identifier')
+  end
+  local status = validate_profile_record(KEYS[index])
+  if status == 'invalid' then
+    return {'invalid_state'}
+  elseif status == 'missing' or status == 'available' then
+    available_count = available_count + 1
+  elseif status == 'cooldown' then
+    cooldown_count = cooldown_count + 1
+    local reset_at = tonumber(redis.call('HGET', KEYS[index], 'reset_at'))
+    if next_recovery_at == nil or reset_at < next_recovery_at then
+      next_recovery_at = reset_at
+    end
+  elseif status == 'half_open' then
+    half_open_count = half_open_count + 1
+    local lease_until = tonumber(redis.call('HGET', KEYS[index], 'lease_until'))
+    if next_recovery_at == nil or lease_until < next_recovery_at then
+      next_recovery_at = lease_until
+    end
+  elseif status == 'disabled' then
+    disabled_count = disabled_count + 1
+  end
+end
+
+local retry_after = nil
+if next_recovery_at ~= nil then
+  retry_after = next_recovery_at - now
+  if retry_after < 1 then
+    retry_after = 1
+  elseif retry_after > 604800 then
+    retry_after = 604800
+  end
+end
+
+return {
+  tostring(available_count),
+  tostring(cooldown_count),
+  tostring(half_open_count),
+  tostring(disabled_count),
+  next_recovery_at == nil and '' or tostring(next_recovery_at),
+  retry_after == nil and '' or tostring(retry_after)
+}
 """
 )
 
@@ -630,7 +716,18 @@ class OpenAIProfileSelection:
     half_open_profiles: int = 0
     disabled_profiles: int = 0
     next_recovery_at: int | None = None
+    retry_after_seconds: int | None = None
     half_open_lease: OpenAIProfileHalfOpenLease | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIProfileAvailability:
+    available_profiles: int
+    cooldown_profiles: int
+    half_open_profiles: int
+    disabled_profiles: int
+    next_recovery_at: int | None
+    retry_after_seconds: int | None
 
 
 class OpenAIProfileFailureUpdateStatus(str, Enum):
@@ -692,6 +789,7 @@ class OpenAISubscriptionAffinityStore:
     DEFAULT_TTL_SECONDS: Final = 24 * 60 * 60
     DEFAULT_HALF_OPEN_LEASE_SECONDS: Final = 30
     MAX_HALF_OPEN_LEASE_SECONDS: Final = 60 * 60
+    MAX_RECOVERY_RETRY_AFTER_SECONDS: Final = 7 * 24 * 60 * 60
     MAX_TIMESTAMP: Final = 253402300799
 
     def __init__(self, cache: DualCache) -> None:
@@ -867,7 +965,7 @@ class OpenAISubscriptionAffinityStore:
                 ),
             )
 
-        if len(response) == 7 and response[0] == OpenAIProfileSelectionStatus.UNAVAILABLE.value:
+        if len(response) == 8 and response[0] == OpenAIProfileSelectionStatus.UNAVAILABLE.value:
             try:
                 current_profile = self._validate_profile_id(response[1]) if response[1] else None
                 remaining_ttl = int(response[2])
@@ -875,6 +973,7 @@ class OpenAISubscriptionAffinityStore:
                 half_open_profiles = int(response[4])
                 disabled_profiles = int(response[5])
                 next_recovery_at = self._parse_optional_timestamp(response[6], "next_recovery_at")
+                retry_after_seconds = int(response[7]) if response[7] else None
             except (TypeError, ValueError) as exc:
                 raise OpenAISubscriptionAffinityStoreError(
                     "OpenAI subscription affinity availability returned invalid data"
@@ -886,6 +985,11 @@ class OpenAISubscriptionAffinityStore:
                 or min(cooldown_profiles, half_open_profiles, disabled_profiles) < 0
                 or cooldown_profiles + half_open_profiles + disabled_profiles != len(profiles)
                 or ((cooldown_profiles + half_open_profiles > 0) != (next_recovery_at is not None))
+                or ((cooldown_profiles + half_open_profiles > 0) != (retry_after_seconds is not None))
+                or (
+                    retry_after_seconds is not None
+                    and not 1 <= retry_after_seconds <= self.MAX_RECOVERY_RETRY_AFTER_SECONDS
+                )
             ):
                 raise OpenAISubscriptionAffinityStoreError(
                     "OpenAI subscription affinity availability returned invalid data"
@@ -898,9 +1002,55 @@ class OpenAISubscriptionAffinityStore:
                 half_open_profiles=half_open_profiles,
                 disabled_profiles=disabled_profiles,
                 next_recovery_at=next_recovery_at,
+                retry_after_seconds=retry_after_seconds,
             )
 
         raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity assignment returned invalid data")
+
+    async def inspect_profile_availability(
+        self,
+        profile_ids: Sequence[str],
+    ) -> OpenAIProfileAvailability:
+        """Atomically summarize every configured profile without changing routing."""
+
+        profiles: Final = self._normalize_profile_ids(profile_ids)
+        response: Final = await self._execute(
+            _PROFILE_AVAILABILITY_SCRIPT,
+            tuple(self.get_profile_state_cache_key(profile_id) for profile_id in profiles),
+            (str(len(profiles)), *profiles),
+        )
+        if len(response) != 6:
+            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile availability returned invalid data")
+        try:
+            available_profiles = int(response[0])
+            cooldown_profiles = int(response[1])
+            half_open_profiles = int(response[2])
+            disabled_profiles = int(response[3])
+            next_recovery_at = self._parse_optional_timestamp(response[4], "next_recovery_at")
+            retry_after_seconds = int(response[5]) if response[5] else None
+        except (TypeError, ValueError) as exc:
+            raise OpenAISubscriptionAffinityStoreError(
+                "OpenAI subscription profile availability returned invalid data"
+            ) from exc
+        if (
+            min(available_profiles, cooldown_profiles, half_open_profiles, disabled_profiles) < 0
+            or available_profiles + cooldown_profiles + half_open_profiles + disabled_profiles != len(profiles)
+            or ((cooldown_profiles + half_open_profiles > 0) != (next_recovery_at is not None))
+            or ((cooldown_profiles + half_open_profiles > 0) != (retry_after_seconds is not None))
+            or (
+                retry_after_seconds is not None
+                and not 1 <= retry_after_seconds <= self.MAX_RECOVERY_RETRY_AFTER_SECONDS
+            )
+        ):
+            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile availability returned invalid data")
+        return OpenAIProfileAvailability(
+            available_profiles=available_profiles,
+            cooldown_profiles=cooldown_profiles,
+            half_open_profiles=half_open_profiles,
+            disabled_profiles=disabled_profiles,
+            next_recovery_at=next_recovery_at,
+            retry_after_seconds=retry_after_seconds,
+        )
 
     async def complete_profile_probe_for_binding(
         self,

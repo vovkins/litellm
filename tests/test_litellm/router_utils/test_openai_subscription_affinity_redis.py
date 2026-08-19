@@ -19,6 +19,7 @@ import pytest_asyncio
 
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.redis_cache import RedisCache
+from litellm.exceptions import RateLimitError, ServiceUnavailableError
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileFailureUpdateStatus,
     OpenAIProfileProbeBindingAction,
@@ -315,8 +316,89 @@ async def test_no_available_profile_preserves_binding_and_counter(
     assert selection.cooldown_profiles == 1
     assert selection.disabled_profiles == 1
     assert selection.next_recovery_at == reset_at
+    assert selection.retry_after_seconds in range(299, 301)
+    availability = await affinity_store.inspect_profile_availability(
+        ["subscription-a", "subscription-b"],
+    )
+    assert availability.available_profiles == 0
+    assert availability.cooldown_profiles == 1
+    assert availability.disabled_profiles == 1
+    assert availability.retry_after_seconds in range(299, 301)
     assert await affinity_store.get_profile(user_hash) == "subscription-a"
     assert await raw_redis_client.exists(affinity_store.COUNTER_CACHE_KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_fully_disabled_pool_has_no_retry_after(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    await affinity_store.disable_profile("subscription-a", "oauth_error")
+    await affinity_store.disable_profile("subscription-b", "oauth_error")
+
+    selection = await affinity_store.select_available_profile(
+        _user_hash(231),
+        ["subscription-a", "subscription-b"],
+        ttl_seconds=60,
+        allow_recovery_probe=True,
+    )
+
+    assert selection.status is OpenAIProfileSelectionStatus.UNAVAILABLE
+    assert selection.cooldown_profiles == 0
+    assert selection.half_open_profiles == 0
+    assert selection.disabled_profiles == 2
+    assert selection.next_recovery_at is None
+    assert selection.retry_after_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_real_cooldown_pool_returns_429_with_nearest_retry_after(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    now = int(time.time())
+    await affinity_store.mark_profile_cooldown("subscription-a", now + 90, "rate_limit")
+    await affinity_store.mark_profile_cooldown("subscription-b", now + 180, "rate_limit")
+    callback = OpenAISubscriptionAffinityCheck(store=affinity_store, ttl_seconds=60)
+    deployments = [
+        {"model_info": {"id": "gpt-a", "openai_oauth_profile": "subscription-a"}},
+        {"model_info": {"id": "gpt-b", "openai_oauth_profile": "subscription-b"}},
+    ]
+
+    with pytest.raises(RateLimitError) as exc_info:
+        await callback.async_filter_deployments(
+            "gpt-5.4",
+            deployments,
+            None,
+            {"metadata": {"user_api_key_hash": _user_hash(232)}},
+        )
+
+    assert int(exc_info.value.headers["retry-after"]) in range(89, 91)
+    assert "subscription-a" not in str(exc_info.value)
+    assert "subscription-b" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_real_disabled_pool_returns_neutral_503(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    await affinity_store.disable_profile("subscription-a", "oauth_error")
+    await affinity_store.disable_profile("subscription-b", "oauth_error")
+    callback = OpenAISubscriptionAffinityCheck(store=affinity_store, ttl_seconds=60)
+    deployments = [
+        {"model_info": {"id": "gpt-a", "openai_oauth_profile": "subscription-a"}},
+        {"model_info": {"id": "gpt-b", "openai_oauth_profile": "subscription-b"}},
+    ]
+
+    with pytest.raises(ServiceUnavailableError) as exc_info:
+        await callback.async_filter_deployments(
+            "gpt-5.4",
+            deployments,
+            None,
+            {"metadata": {"user_api_key_hash": _user_hash(233)}},
+        )
+
+    assert exc_info.value.status_code == 503
+    assert "subscription-a" not in str(exc_info.value)
+    assert "subscription-b" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
