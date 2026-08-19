@@ -7,11 +7,14 @@ import pytest
 
 from litellm.caching.dual_cache import DualCache
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileFailureUpdateStatus,
     OpenAIProfileHalfOpenLease,
+    OpenAIProfileSelectionStatus,
     OpenAIProfileState,
     OpenAIProfileStateSnapshot,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
+    OpenAISubscriptionNoAvailableProfilesError,
 )
 
 USER_KEY_HASH = "a" * 64
@@ -19,6 +22,9 @@ PROFILE_ID = "openai-oauth-1"
 AFFINITY_KEY = f"openai_subscription_affinity:{{v1}}:binding:{USER_KEY_HASH}"
 COUNTER_KEY = "openai_subscription_affinity:{v1}:counter"
 PROFILE_STATE_KEY = "openai_subscription_affinity:{v1}:profile:openai-oauth-1"
+SUBSCRIPTION_A_STATE_KEY = "openai_subscription_affinity:{v1}:profile:subscription-a"
+SUBSCRIPTION_B_STATE_KEY = "openai_subscription_affinity:{v1}:profile:subscription-b"
+SUBSCRIPTION_C_STATE_KEY = "openai_subscription_affinity:{v1}:profile:subscription-c"
 
 
 def make_store(response: object = None) -> tuple[OpenAISubscriptionAffinityStore, AsyncMock]:
@@ -191,7 +197,7 @@ async def test_get_or_assign_profile_normalizes_profiles_and_uses_shared_counter
 
     assert profile_id == "subscription-a"
     script.assert_awaited_once_with(
-        keys=(AFFINITY_KEY, COUNTER_KEY),
+        keys=(AFFINITY_KEY, COUNTER_KEY, SUBSCRIPTION_A_STATE_KEY, SUBSCRIPTION_B_STATE_KEY),
         args=("86400", "2", "subscription-a", "subscription-b"),
         client=None,
     )
@@ -210,7 +216,13 @@ async def test_adding_profile_preserves_existing_binding() -> None:
         == "subscription-a"
     )
     script.assert_awaited_once_with(
-        keys=(AFFINITY_KEY, COUNTER_KEY),
+        keys=(
+            AFFINITY_KEY,
+            COUNTER_KEY,
+            SUBSCRIPTION_A_STATE_KEY,
+            SUBSCRIPTION_B_STATE_KEY,
+            SUBSCRIPTION_C_STATE_KEY,
+        ),
         args=("86400", "3", "subscription-a", "subscription-b", "subscription-c"),
         client=None,
     )
@@ -232,6 +244,167 @@ async def test_get_or_assign_profile_rejects_invalid_profile_in_collection() -> 
 
     with pytest.raises(ValueError, match="profile_id"):
         await store.get_or_assign_profile(USER_KEY_HASH, ["subscription-a", "UNSAFE"], ttl_seconds=60)
+    script.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_select_available_profile_returns_typed_unavailable_summary() -> None:
+    store, _ = make_store(
+        [
+            b"unavailable",
+            b"subscription-a",
+            b"321",
+            b"1",
+            b"0",
+            b"1",
+            b"1700000100",
+        ]
+    )
+
+    selection = await store.select_available_profile(
+        USER_KEY_HASH,
+        ["subscription-a", "subscription-b"],
+    )
+
+    assert selection.status is OpenAIProfileSelectionStatus.UNAVAILABLE
+    assert selection.profile_id is None
+    assert selection.remaining_ttl_seconds == 321
+    assert selection.cooldown_profiles == 1
+    assert selection.half_open_profiles == 0
+    assert selection.disabled_profiles == 1
+    assert selection.next_recovery_at == 1700000100
+
+
+@pytest.mark.asyncio
+async def test_get_or_assign_profile_raises_typed_error_when_all_profiles_are_unavailable() -> None:
+    store, _ = make_store([b"unavailable", b"", b"-2", b"0", b"0", b"2", b""])
+
+    with pytest.raises(OpenAISubscriptionNoAvailableProfilesError) as exc_info:
+        await store.get_or_assign_profile(
+            USER_KEY_HASH,
+            ["subscription-a", "subscription-b"],
+        )
+
+    assert exc_info.value.selection.disabled_profiles == 2
+    assert USER_KEY_HASH not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        [b"invalid_state"],
+        [b"invalid_binding"],
+        [b"unavailable", b"", b"-2", b"1", b"0", b"0", b""],
+        [b"unavailable", b"", b"60", b"0", b"0", b"2", b""],
+        [b"unavailable", b"subscription-a", b"60", b"1", b"0", b"1", b""],
+        [b"assigned", b"not-in-pool", b"60"],
+    ],
+)
+@pytest.mark.asyncio
+async def test_state_aware_assignment_fails_closed_on_invalid_result(response: object) -> None:
+    store, _ = make_store(response)
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await store.select_available_profile(
+            USER_KEY_HASH,
+            ["subscription-a", "subscription-b"],
+            ttl_seconds=60,
+        )
+
+
+@pytest.mark.parametrize(
+    ("target_state", "reset_at", "reason_code", "response", "expected_state"),
+    [
+        (
+            OpenAIProfileState.COOLDOWN,
+            1700000100,
+            "rate_limit",
+            [b"applied", b"cooldown"],
+            OpenAIProfileState.COOLDOWN,
+        ),
+        (
+            OpenAIProfileState.DISABLED,
+            None,
+            "oauth_error",
+            [b"applied", b"disabled"],
+            OpenAIProfileState.DISABLED,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_profile_failure_updates_state_and_binding_in_one_script(
+    target_state: OpenAIProfileState,
+    reset_at: int | None,
+    reason_code: str,
+    response: object,
+    expected_state: OpenAIProfileState,
+) -> None:
+    store, script = make_store(response)
+
+    update = await store.fail_profile_if_current_binding(
+        USER_KEY_HASH,
+        PROFILE_ID,
+        target_state,
+        reset_at=reset_at,
+        reason_code=reason_code,
+    )
+
+    assert update.status is OpenAIProfileFailureUpdateStatus.APPLIED
+    assert update.effective_state is expected_state
+    script.assert_awaited_once_with(
+        keys=(AFFINITY_KEY, PROFILE_STATE_KEY),
+        args=(
+            PROFILE_ID,
+            target_state.value,
+            str(reset_at) if reset_at is not None else "",
+            reason_code,
+        ),
+        client=None,
+    )
+
+
+@pytest.mark.parametrize("reason", [b"missing", b"mismatch"])
+@pytest.mark.asyncio
+async def test_profile_failure_reports_stale_compare_and_swap(reason: bytes) -> None:
+    store, _ = make_store([b"stale", reason])
+
+    update = await store.fail_profile_if_current_binding(
+        USER_KEY_HASH,
+        PROFILE_ID,
+        OpenAIProfileState.DISABLED,
+        reason_code="oauth_error",
+    )
+
+    assert update.status is OpenAIProfileFailureUpdateStatus.STALE
+    assert update.effective_state is None
+
+
+@pytest.mark.parametrize(
+    ("target_state", "reset_at", "reason_code", "message"),
+    [
+        (OpenAIProfileState.AVAILABLE, None, "oauth_error", "target_state"),
+        (OpenAIProfileState.COOLDOWN, None, "rate_limit", "requires"),
+        (OpenAIProfileState.DISABLED, 1700000100, "oauth_error", "does not accept"),
+        (OpenAIProfileState.DISABLED, None, "unsafe reason", "reason_code"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_profile_failure_rejects_invalid_transition_contract(
+    target_state: OpenAIProfileState,
+    reset_at: int | None,
+    reason_code: str,
+    message: str,
+) -> None:
+    store, script = make_store([b"applied", b"disabled"])
+
+    with pytest.raises(ValueError, match=message):
+        await store.fail_profile_if_current_binding(
+            USER_KEY_HASH,
+            PROFILE_ID,
+            target_state,
+            reset_at=reset_at,
+            reason_code=reason_code,
+        )
     script.assert_not_awaited()
 
 

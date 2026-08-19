@@ -8,6 +8,11 @@ import pytest
 import litellm
 from litellm.exceptions import ServiceUnavailableError
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileFailureUpdate,
+    OpenAIProfileFailureUpdateStatus,
+    OpenAIProfileSelection,
+    OpenAIProfileSelectionStatus,
+    OpenAIProfileState,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
 )
@@ -48,10 +53,18 @@ def make_request_kwargs(user_api_key_hash: object = USER_KEY_HASH) -> dict:
     return {"metadata": {"user_api_key_hash": user_api_key_hash}}
 
 
+def make_selection(profile_id: str) -> OpenAIProfileSelection:
+    return OpenAIProfileSelection(
+        status=OpenAIProfileSelectionStatus.EXISTING,
+        profile_id=profile_id,
+        remaining_ttl_seconds=60,
+    )
+
+
 @pytest.mark.asyncio
 async def test_routing_filters_oauth_deployments_to_assigned_profile() -> None:
     callback, store = make_routing_callback()
-    store.get_or_assign_profile.return_value = SECOND_PROFILE_ID
+    store.select_available_profile.return_value = make_selection(SECOND_PROFILE_ID)
     deployments = [
         make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
         make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
@@ -65,7 +78,7 @@ async def test_routing_filters_oauth_deployments_to_assigned_profile() -> None:
     )
 
     assert filtered == [deployments[1]]
-    store.get_or_assign_profile.assert_awaited_once_with(
+    store.select_available_profile.assert_awaited_once_with(
         user_api_key_hash=USER_KEY_HASH,
         available_profile_ids=[PROFILE_ID, SECOND_PROFILE_ID],
         ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
@@ -75,7 +88,7 @@ async def test_routing_filters_oauth_deployments_to_assigned_profile() -> None:
 @pytest.mark.asyncio
 async def test_one_binding_is_used_across_openai_model_groups() -> None:
     callback, store = make_routing_callback()
-    store.get_or_assign_profile.return_value = PROFILE_ID
+    store.select_available_profile.return_value = make_selection(PROFILE_ID)
     gpt_deployments = [
         make_deployment("gpt-5.4", "gpt-a", PROFILE_ID),
         make_deployment("gpt-5.4", "gpt-b", SECOND_PROFILE_ID),
@@ -90,7 +103,7 @@ async def test_one_binding_is_used_across_openai_model_groups() -> None:
 
     assert first == [gpt_deployments[0]]
     assert second == [codex_deployments[0]]
-    assert [call.kwargs["user_api_key_hash"] for call in store.get_or_assign_profile.await_args_list] == [
+    assert [call.kwargs["user_api_key_hash"] for call in store.select_available_profile.await_args_list] == [
         USER_KEY_HASH,
         USER_KEY_HASH,
     ]
@@ -107,7 +120,7 @@ async def test_glm_deployments_are_not_processed_by_openai_affinity() -> None:
     filtered = await callback.async_filter_deployments("glm-5.2", deployments, None, make_request_kwargs())
 
     assert filtered == deployments
-    store.get_or_assign_profile.assert_not_awaited()
+    store.select_available_profile.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -124,13 +137,13 @@ async def test_oauth_routing_requires_virtual_key_hash(request_kwargs: dict | No
 
     assert exc_info.value.status_code == 503
     assert PROFILE_ID not in str(exc_info.value)
-    store.get_or_assign_profile.assert_not_awaited()
+    store.select_available_profile.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_responses_metadata_can_supply_virtual_key_hash() -> None:
     callback, store = make_routing_callback()
-    store.get_or_assign_profile.return_value = PROFILE_ID
+    store.select_available_profile.return_value = make_selection(PROFILE_ID)
     deployments = [make_deployment("gpt-5.4", "deployment-a", PROFILE_ID)]
 
     filtered = await callback.async_filter_deployments(
@@ -161,7 +174,7 @@ async def test_invalid_oauth_model_group_fails_closed(deployments: list[dict]) -
         await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
 
     assert exc_info.value.status_code == 503
-    store.get_or_assign_profile.assert_not_awaited()
+    store.select_available_profile.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -174,7 +187,7 @@ async def test_invalid_oauth_model_group_fails_closed(deployments: list[dict]) -
 @pytest.mark.asyncio
 async def test_shared_state_failure_returns_neutral_503(side_effect: Exception) -> None:
     callback, store = make_routing_callback()
-    store.get_or_assign_profile.side_effect = side_effect
+    store.select_available_profile.side_effect = side_effect
     deployments = [make_deployment("gpt-5.4", "deployment-a", PROFILE_ID)]
 
     with pytest.raises(ServiceUnavailableError) as exc_info:
@@ -190,11 +203,35 @@ async def test_shared_state_failure_returns_neutral_503(side_effect: Exception) 
 @pytest.mark.asyncio
 async def test_unhealthy_bound_profile_does_not_fall_back_randomly() -> None:
     callback, store = make_routing_callback()
-    store.get_or_assign_profile.return_value = SECOND_PROFILE_ID
+    store.select_available_profile.return_value = make_selection(SECOND_PROFILE_ID)
     deployments = [make_deployment("gpt-5.4", "deployment-a", PROFILE_ID)]
 
     with pytest.raises(ServiceUnavailableError):
         await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
+
+
+@pytest.mark.asyncio
+async def test_no_available_profile_returns_neutral_503() -> None:
+    callback, store = make_routing_callback()
+    store.select_available_profile.return_value = OpenAIProfileSelection(
+        status=OpenAIProfileSelectionStatus.UNAVAILABLE,
+        profile_id=None,
+        remaining_ttl_seconds=60,
+        cooldown_profiles=1,
+        disabled_profiles=1,
+        next_recovery_at=1700000100,
+    )
+    deployments = [
+        make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
+        make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
+    ]
+
+    with pytest.raises(ServiceUnavailableError) as exc_info:
+        await callback.async_filter_deployments("gpt-5.4", deployments, None, make_request_kwargs())
+
+    assert exc_info.value.status_code == 503
+    assert PROFILE_ID not in str(exc_info.value)
+    assert SECOND_PROFILE_ID not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -232,7 +269,7 @@ async def test_router_registers_and_separates_openai_and_glm_affinity() -> None:
         assert deployment_callback._get_effective_flags("gpt-5.4") == (False, False, False)
 
         openai_callback = openai_callbacks[0]
-        openai_callback.store.get_or_assign_profile = AsyncMock(return_value=SECOND_PROFILE_ID)
+        openai_callback.store.select_available_profile = AsyncMock(return_value=make_selection(SECOND_PROFILE_ID))
         oauth_deployments = [
             make_deployment("gpt-5.4", "oauth-a", PROFILE_ID),
             make_deployment("gpt-5.4", "oauth-b", SECOND_PROFILE_ID),
@@ -259,7 +296,7 @@ async def test_router_registers_and_separates_openai_and_glm_affinity() -> None:
 
         assert filtered_oauth == [oauth_deployments[1]]
         assert filtered_glm == glm_deployments
-        openai_callback.store.get_or_assign_profile.assert_awaited_once()
+        openai_callback.store.select_available_profile.assert_awaited_once()
     finally:
         if router is not None:
             router.discard()
@@ -361,6 +398,127 @@ async def test_failure_event_does_not_refresh_binding() -> None:
     await callback.async_log_failure_event(make_success_kwargs(), {}, 0, 1)
 
     refresh.assert_not_awaited()
+
+
+def make_failure_kwargs(error: BaseException, **overrides: object) -> dict:
+    kwargs = make_success_kwargs(**overrides)
+    kwargs["exception"] = error
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_failure_moves_current_profile_to_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback, store = make_routing_callback()
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 429  # type: ignore[attr-defined]
+    error.headers = {"Retry-After": "120"}  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "litellm.router_utils.openai_subscription_failure_classifier.time.time",
+        lambda: 1700000000,
+    )
+    store.fail_profile_if_current_binding.return_value = OpenAIProfileFailureUpdate(
+        status=OpenAIProfileFailureUpdateStatus.APPLIED,
+        effective_state=OpenAIProfileState.COOLDOWN,
+    )
+
+    await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+
+    store.fail_profile_if_current_binding.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        profile_id=PROFILE_ID,
+        target_state=OpenAIProfileState.COOLDOWN,
+        reason_code="rate_limit",
+        reset_at=1700000120,
+    )
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+@pytest.mark.asyncio
+async def test_auth_failure_disables_current_profile(status_code: int) -> None:
+    callback, store = make_routing_callback()
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = status_code  # type: ignore[attr-defined]
+    store.fail_profile_if_current_binding.return_value = OpenAIProfileFailureUpdate(
+        status=OpenAIProfileFailureUpdateStatus.APPLIED,
+        effective_state=OpenAIProfileState.DISABLED,
+    )
+
+    await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+
+    store.fail_profile_if_current_binding.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        profile_id=PROFILE_ID,
+        target_state=OpenAIProfileState.DISABLED,
+        reason_code="oauth_error",
+        reset_at=None,
+    )
+
+
+@pytest.mark.parametrize("status_code", [404, 500])
+@pytest.mark.asyncio
+async def test_non_profile_failure_does_not_change_subscription_state(status_code: int) -> None:
+    callback, store = make_routing_callback()
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = status_code  # type: ignore[attr-defined]
+
+    await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+
+    store.fail_profile_if_current_binding.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_profile_failure_requires_trusted_user_and_selected_profile_metadata() -> None:
+    callback, store = make_routing_callback()
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 429  # type: ignore[attr-defined]
+    kwargs = make_failure_kwargs(error)
+    kwargs["standard_logging_object"] = {
+        "metadata": {
+            "user_api_key_hash": None,
+            "openai_oauth_profile": "attacker-profile",
+        }
+    }
+
+    await callback.async_log_failure_event(kwargs, {}, 0, 1)
+
+    store.fail_profile_if_current_binding.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_profile_failure_is_idempotently_ignored() -> None:
+    callback, store = make_routing_callback()
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 401  # type: ignore[attr-defined]
+    store.fail_profile_if_current_binding.return_value = OpenAIProfileFailureUpdate(
+        status=OpenAIProfileFailureUpdateStatus.STALE,
+        effective_state=None,
+    )
+
+    await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+    await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+
+    assert store.fail_profile_if_current_binding.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_profile_failure_storage_error_is_logged_without_sensitive_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    callback, store = make_routing_callback()
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 401  # type: ignore[attr-defined]
+    store.fail_profile_if_current_binding.side_effect = OpenAISubscriptionAffinityStoreError(
+        f"backend failed for {USER_KEY_HASH} and {PROFILE_ID}"
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await callback.async_log_failure_event(make_failure_kwargs(error), {}, 0, 1)
+
+    assert "could not persist a profile-scoped failure" in caplog.text
+    assert USER_KEY_HASH not in caplog.text
+    assert PROFILE_ID not in caplog.text
 
 
 @pytest.mark.asyncio

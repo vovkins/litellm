@@ -50,28 +50,7 @@ end
 return redis.error_reply('unsupported affinity store operation')
 """
 
-_ASSIGN_PROFILE_SCRIPT: Final = """
-local current = redis.call('GET', KEYS[1])
-if current ~= false then
-  return {'existing', current, tostring(redis.call('TTL', KEYS[1]))}
-end
-
-local ttl = tonumber(ARGV[1])
-local profile_count = tonumber(ARGV[2])
-if ttl == nil or ttl <= 0 or profile_count == nil or profile_count <= 0 then
-  return redis.error_reply('invalid affinity assignment arguments')
-end
-
-local sequence = redis.call('INCR', KEYS[2])
-local profile_index = ((sequence - 1) % profile_count) + 1
-local selected_profile = ARGV[profile_index + 2]
-redis.call('SET', KEYS[1], selected_profile, 'EX', ttl)
-return {'assigned', selected_profile, tostring(ttl)}
-"""
-
-_PROFILE_STATE_SCRIPT: Final = """
-local operation = ARGV[1]
-
+_PROFILE_STATE_VALIDATION_LUA: Final = """
 local function is_positive_integer(value, maximum)
   if value == false or value == nil or string.match(value, '^%d+$') == nil then
     return false
@@ -94,21 +73,28 @@ local function is_lease_token(value)
     and string.match(value, '^[0-9a-f]+$') ~= nil
 end
 
-local function validate_record()
-  local state = redis.call('HGET', KEYS[1], 'state')
+local function is_profile_id(value)
+  return value ~= false
+    and value ~= nil
+    and string.len(value) <= 64
+    and string.match(value, '^[a-z0-9][a-z0-9_-]*$') ~= nil
+end
+
+local function validate_profile_record(state_key)
+  local state = redis.call('HGET', state_key, 'state')
   if state == false then
-    if redis.call('EXISTS', KEYS[1]) == 0 then
+    if redis.call('EXISTS', state_key) == 0 then
       return 'missing'
     end
     return 'invalid'
   end
 
-  local reset_at = redis.call('HGET', KEYS[1], 'reset_at')
-  local lease_token = redis.call('HGET', KEYS[1], 'lease_token')
-  local lease_until = redis.call('HGET', KEYS[1], 'lease_until')
-  local reason = redis.call('HGET', KEYS[1], 'reason')
-  local updated_at = redis.call('HGET', KEYS[1], 'updated_at')
-  local field_count = redis.call('HLEN', KEYS[1])
+  local reset_at = redis.call('HGET', state_key, 'reset_at')
+  local lease_token = redis.call('HGET', state_key, 'lease_token')
+  local lease_until = redis.call('HGET', state_key, 'lease_until')
+  local reason = redis.call('HGET', state_key, 'reason')
+  local updated_at = redis.call('HGET', state_key, 'updated_at')
+  local field_count = redis.call('HLEN', state_key)
 
   if not is_positive_integer(updated_at, 253402300799) then
     return 'invalid'
@@ -150,6 +136,175 @@ local function validate_record()
   end
   return state
 end
+"""
+
+_ASSIGN_PROFILE_SCRIPT: Final = (
+    _PROFILE_STATE_VALIDATION_LUA
+    + """
+local ttl = tonumber(ARGV[1])
+local profile_count = tonumber(ARGV[2])
+if ttl == nil or ttl <= 0 or profile_count == nil or profile_count <= 0 then
+  return redis.error_reply('invalid affinity assignment arguments')
+end
+if #KEYS ~= profile_count + 2 or #ARGV ~= profile_count + 2 then
+  return redis.error_reply('invalid affinity assignment shape')
+end
+
+local current = redis.call('GET', KEYS[1])
+if current ~= false and not is_profile_id(current) then
+  return {'invalid_binding'}
+end
+local current_ttl = -2
+if current ~= false then
+  current_ttl = redis.call('TTL', KEYS[1])
+  if current_ttl < 0 then
+    return {'invalid_binding'}
+  end
+end
+
+local eligible = {}
+local current_is_available = false
+local cooldown_count = 0
+local half_open_count = 0
+local disabled_count = 0
+local next_recovery_at = nil
+
+for index = 1, profile_count do
+  local profile_id = ARGV[index + 2]
+  if not is_profile_id(profile_id) then
+    return redis.error_reply('invalid affinity profile identifier')
+  end
+  local state_key = KEYS[index + 2]
+  local status = validate_profile_record(state_key)
+  if status == 'invalid' then
+    return {'invalid_state'}
+  end
+  if status == 'missing' or status == 'available' then
+    table.insert(eligible, profile_id)
+    if current == profile_id then
+      current_is_available = true
+    end
+  elseif status == 'cooldown' then
+    cooldown_count = cooldown_count + 1
+    local reset_at = tonumber(redis.call('HGET', state_key, 'reset_at'))
+    if next_recovery_at == nil or reset_at < next_recovery_at then
+      next_recovery_at = reset_at
+    end
+  elseif status == 'half_open' then
+    half_open_count = half_open_count + 1
+    local lease_until = tonumber(redis.call('HGET', state_key, 'lease_until'))
+    if next_recovery_at == nil or lease_until < next_recovery_at then
+      next_recovery_at = lease_until
+    end
+  elseif status == 'disabled' then
+    disabled_count = disabled_count + 1
+  end
+end
+
+if current_is_available then
+  return {'existing', current, tostring(current_ttl)}
+end
+
+if #eligible == 0 then
+  local current_value = current == false and '' or current
+  return {
+    'unavailable',
+    current_value,
+    tostring(current_ttl),
+    tostring(cooldown_count),
+    tostring(half_open_count),
+    tostring(disabled_count),
+    next_recovery_at == nil and '' or tostring(next_recovery_at)
+  }
+end
+
+local sequence = redis.call('INCR', KEYS[2])
+local selected_profile = eligible[((sequence - 1) % #eligible) + 1]
+redis.call('SET', KEYS[1], selected_profile, 'EX', ttl)
+return {current == false and 'assigned' or 'reassigned', selected_profile, tostring(ttl)}
+"""
+)
+
+_FAIL_PROFILE_SCRIPT: Final = (
+    _PROFILE_STATE_VALIDATION_LUA
+    + """
+local expected_profile = ARGV[1]
+local target_state = ARGV[2]
+local reset_at = ARGV[3]
+local reason = ARGV[4]
+if #KEYS ~= 2 or #ARGV ~= 4 then
+  return redis.error_reply('invalid profile failure shape')
+end
+if not is_profile_id(expected_profile) or not is_reason_code(reason) then
+  return redis.error_reply('invalid profile failure arguments')
+end
+if target_state ~= 'cooldown' and target_state ~= 'disabled' then
+  return redis.error_reply('invalid profile failure target')
+end
+if target_state == 'cooldown' and not is_positive_integer(reset_at, 253402300799) then
+  return redis.error_reply('invalid profile cooldown target')
+end
+if target_state == 'disabled' and reset_at ~= '' then
+  return redis.error_reply('invalid profile disabled target')
+end
+
+local current = redis.call('GET', KEYS[1])
+if current == false then
+  return {'stale', 'missing'}
+end
+if not is_profile_id(current) then
+  return {'invalid_binding'}
+end
+if current ~= expected_profile then
+  return {'stale', 'mismatch'}
+end
+
+local status = validate_profile_record(KEYS[2])
+if status == 'invalid' then
+  return {'invalid_state'}
+end
+
+local now = tonumber(redis.call('TIME')[1])
+local effective_state = status == 'missing' and 'available' or status
+if status ~= 'half_open' then
+  if target_state == 'disabled' then
+    redis.call(
+      'HSET', KEYS[2],
+      'state', 'disabled',
+      'reason', reason,
+      'updated_at', tostring(now)
+    )
+    redis.call('HDEL', KEYS[2], 'reset_at', 'lease_token', 'lease_until')
+    effective_state = 'disabled'
+  elseif status ~= 'disabled' then
+    local requested_reset_at = tonumber(reset_at)
+    if status == 'cooldown' then
+      local current_reset_at = tonumber(redis.call('HGET', KEYS[2], 'reset_at'))
+      if current_reset_at > requested_reset_at then
+        requested_reset_at = current_reset_at
+      end
+    end
+    redis.call(
+      'HSET', KEYS[2],
+      'state', 'cooldown',
+      'reset_at', tostring(requested_reset_at),
+      'reason', reason,
+      'updated_at', tostring(now)
+    )
+    redis.call('HDEL', KEYS[2], 'lease_token', 'lease_until')
+    effective_state = 'cooldown'
+  end
+end
+
+redis.call('DEL', KEYS[1])
+return {'applied', effective_state}
+"""
+)
+
+_PROFILE_STATE_SCRIPT: Final = (
+    _PROFILE_STATE_VALIDATION_LUA
+    + """
+local operation = ARGV[1]
 
 local function snapshot()
   local state = redis.call('HGET', KEYS[1], 'state')
@@ -166,7 +321,7 @@ local function snapshot()
   }
 end
 
-local status = validate_record()
+local status = validate_profile_record(KEYS[1])
 if status == 'invalid' then
   return {'invalid'}
 end
@@ -289,6 +444,7 @@ end
 
 return redis.error_reply('unsupported profile state operation')
 """
+)
 
 _SHA256_HEX_PATTERN: Final = re.compile(r"^[0-9a-fA-F]{64}$")
 _PROFILE_ID_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -314,6 +470,14 @@ class OpenAISubscriptionAffinityStoreError(RuntimeError):
     """The shared affinity state cannot be read or changed safely."""
 
 
+class OpenAISubscriptionNoAvailableProfilesError(OpenAISubscriptionAffinityStoreError):
+    """No configured OAuth profile is eligible for normal traffic."""
+
+    def __init__(self, selection: OpenAIProfileSelection) -> None:
+        super().__init__("No OpenAI subscription profile is currently available")
+        self.selection = selection
+
+
 @dataclass(frozen=True, slots=True)
 class _AffinitySnapshot:
     profile_id: str
@@ -327,6 +491,39 @@ class OpenAIProfileState(str, Enum):
     COOLDOWN = "cooldown"
     HALF_OPEN = "half_open"
     DISABLED = "disabled"
+
+
+class OpenAIProfileSelectionStatus(str, Enum):
+    """Outcome of one atomic state-aware affinity decision."""
+
+    EXISTING = "existing"
+    ASSIGNED = "assigned"
+    REASSIGNED = "reassigned"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIProfileSelection:
+    status: OpenAIProfileSelectionStatus
+    profile_id: str | None
+    remaining_ttl_seconds: int | None
+    cooldown_profiles: int = 0
+    half_open_profiles: int = 0
+    disabled_profiles: int = 0
+    next_recovery_at: int | None = None
+
+
+class OpenAIProfileFailureUpdateStatus(str, Enum):
+    """CAS outcome for a profile-scoped provider failure."""
+
+    APPLIED = "applied"
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIProfileFailureUpdate:
+    status: OpenAIProfileFailureUpdateStatus
+    effective_state: OpenAIProfileState | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,36 +632,164 @@ class OpenAISubscriptionAffinityStore:
         available_profile_ids: Sequence[str],
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
     ) -> str:
-        """Return an existing binding or atomically assign the next profile.
+        """Return an available binding or raise a typed availability error."""
+
+        selection: Final = await self.select_available_profile(
+            user_api_key_hash=user_api_key_hash,
+            available_profile_ids=available_profile_ids,
+            ttl_seconds=ttl_seconds,
+        )
+        if selection.profile_id is None:
+            raise OpenAISubscriptionNoAvailableProfilesError(selection)
+        return selection.profile_id
+
+    async def select_available_profile(
+        self,
+        user_api_key_hash: str,
+        available_profile_ids: Sequence[str],
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> OpenAIProfileSelection:
+        """Atomically preserve or assign a profile eligible for normal traffic.
 
         Profile order supplied by callers cannot affect distribution: identifiers
         are validated, de-duplicated, and sorted before the Redis script runs.
-        An existing binding is returned as-is and its TTL is never refreshed here.
-        Consequently, adding a profile grows the pool only for new or expired
-        bindings instead of redistributing active virtual keys.
+        Missing state records and explicit ``available`` records are eligible.
+        ``cooldown``, ``half_open`` and ``disabled`` profiles are excluded. An
+        eligible existing binding is kept without refreshing its TTL; an
+        unavailable or removed binding is replaced through the same shared
+        round-robin counter used for first assignments.
         """
 
         cache_key: Final = self.get_cache_key(user_api_key_hash)
         profiles: Final = self._normalize_profile_ids(available_profile_ids)
         validated_ttl: Final = self._validate_ttl(ttl_seconds)
+        state_keys: Final = tuple(self.get_profile_state_cache_key(profile_id) for profile_id in profiles)
         response: Final = await self._execute(
             _ASSIGN_PROFILE_SCRIPT,
-            (cache_key, self.COUNTER_CACHE_KEY),
+            (cache_key, self.COUNTER_CACHE_KEY, *state_keys),
             (str(validated_ttl), str(len(profiles)), *profiles),
         )
-        if len(response) != 3 or response[0] not in {"existing", "assigned"}:
-            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity assignment returned invalid data")
+        if len(response) == 3 and response[0] in {
+            OpenAIProfileSelectionStatus.EXISTING.value,
+            OpenAIProfileSelectionStatus.ASSIGNED.value,
+            OpenAIProfileSelectionStatus.REASSIGNED.value,
+        }:
+            try:
+                status: Final = OpenAIProfileSelectionStatus(response[0])
+                profile_id: Final = self._validate_profile_id(response[1])
+                remaining_ttl: Final = int(response[2])
+            except (TypeError, ValueError) as exc:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription affinity assignment returned invalid data"
+                ) from exc
+            if profile_id not in profiles or remaining_ttl < 0:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription affinity assignment returned invalid data"
+                )
+            return OpenAIProfileSelection(
+                status=status,
+                profile_id=profile_id,
+                remaining_ttl_seconds=remaining_ttl,
+            )
 
-        try:
-            profile_id: Final = self._validate_profile_id(response[1])
-            remaining_ttl: Final = int(response[2])
-        except (TypeError, ValueError) as exc:
-            raise OpenAISubscriptionAffinityStoreError(
-                "OpenAI subscription affinity assignment returned invalid data"
-            ) from exc
-        if remaining_ttl < 0:
-            raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity has no valid expiry")
-        return profile_id
+        if len(response) == 7 and response[0] == OpenAIProfileSelectionStatus.UNAVAILABLE.value:
+            try:
+                current_profile = self._validate_profile_id(response[1]) if response[1] else None
+                remaining_ttl = int(response[2])
+                cooldown_profiles = int(response[3])
+                half_open_profiles = int(response[4])
+                disabled_profiles = int(response[5])
+                next_recovery_at = self._parse_optional_timestamp(response[6], "next_recovery_at")
+            except (TypeError, ValueError) as exc:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription affinity availability returned invalid data"
+                ) from exc
+            if (
+                remaining_ttl < -2
+                or (current_profile is None and remaining_ttl != -2)
+                or (current_profile is not None and remaining_ttl < 0)
+                or min(cooldown_profiles, half_open_profiles, disabled_profiles) < 0
+                or cooldown_profiles + half_open_profiles + disabled_profiles != len(profiles)
+                or ((cooldown_profiles + half_open_profiles > 0) != (next_recovery_at is not None))
+            ):
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription affinity availability returned invalid data"
+                )
+            return OpenAIProfileSelection(
+                status=OpenAIProfileSelectionStatus.UNAVAILABLE,
+                profile_id=None,
+                remaining_ttl_seconds=remaining_ttl if current_profile is not None else None,
+                cooldown_profiles=cooldown_profiles,
+                half_open_profiles=half_open_profiles,
+                disabled_profiles=disabled_profiles,
+                next_recovery_at=next_recovery_at,
+            )
+
+        raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity assignment returned invalid data")
+
+    async def fail_profile_if_current_binding(
+        self,
+        user_api_key_hash: str,
+        profile_id: str,
+        target_state: OpenAIProfileState,
+        *,
+        reason_code: str,
+        reset_at: int | None = None,
+    ) -> OpenAIProfileFailureUpdate:
+        """Apply a profile failure and remove only its still-current binding.
+
+        The state transition and compare-and-delete execute in one Redis script.
+        A delayed failure from an old request therefore cannot replace or remove
+        a newer binding. Existing ``disabled`` state is never downgraded to a
+        cooldown, and an active ``half_open`` lease is owned by its probe and is
+        not overwritten by an unrelated delayed request.
+        """
+
+        cache_key: Final = self.get_cache_key(user_api_key_hash)
+        validated_profile_id: Final = self._validate_profile_id(profile_id)
+        validated_reason: Final = self._validate_reason_code(reason_code)
+        if target_state is OpenAIProfileState.COOLDOWN:
+            if reset_at is None:
+                raise ValueError("cooldown target_state requires reset_at")
+            validated_reset_at = str(self._validate_timestamp(reset_at, "reset_at"))
+        elif target_state is OpenAIProfileState.DISABLED:
+            if reset_at is not None:
+                raise ValueError("disabled target_state does not accept reset_at")
+            validated_reset_at = ""
+        else:
+            raise ValueError("target_state must be cooldown or disabled")
+
+        response: Final = await self._execute(
+            _FAIL_PROFILE_SCRIPT,
+            (cache_key, self.get_profile_state_cache_key(validated_profile_id)),
+            (
+                validated_profile_id,
+                target_state.value,
+                validated_reset_at,
+                validated_reason,
+            ),
+        )
+        if len(response) == 2 and response[0] == OpenAIProfileFailureUpdateStatus.STALE.value:
+            if response[1] not in {"missing", "mismatch"}:
+                raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile failure returned invalid data")
+            return OpenAIProfileFailureUpdate(
+                status=OpenAIProfileFailureUpdateStatus.STALE,
+                effective_state=None,
+            )
+        if len(response) == 2 and response[0] == OpenAIProfileFailureUpdateStatus.APPLIED.value:
+            try:
+                effective_state: Final = OpenAIProfileState(response[1])
+            except ValueError as exc:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription profile failure returned invalid data"
+                ) from exc
+            if effective_state is OpenAIProfileState.AVAILABLE:
+                raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile failure returned invalid data")
+            return OpenAIProfileFailureUpdate(
+                status=OpenAIProfileFailureUpdateStatus.APPLIED,
+                effective_state=effective_state,
+            )
+        raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile failure returned invalid data")
 
     async def get_profile_state(self, profile_id: str) -> OpenAIProfileStateSnapshot:
         """Read one profile state; an unknown profile starts as available."""

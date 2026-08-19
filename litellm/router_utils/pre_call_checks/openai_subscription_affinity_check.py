@@ -9,18 +9,23 @@ from litellm._logging import verbose_router_logger
 from litellm.exceptions import ServiceUnavailableError
 from litellm.integrations.custom_logger import CustomLogger, Span
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileFailureUpdateStatus,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
+)
+from litellm.router_utils.openai_subscription_failure_classifier import (
+    classify_openai_subscription_failure,
 )
 from litellm.types.llms.openai import AllMessageValues
 
 
 class OpenAISubscriptionAffinityCheck(CustomLogger):
-    """Route OAuth models by subscription and keep successful bindings alive.
+    """Route OAuth models by subscription and maintain profile availability.
 
-    Profile health and failover are implemented separately. This callback uses
-    only currently healthy deployments and intentionally extends affinity only
-    from final success events.
+    Successful responses extend the current binding. Profile-scoped provider
+    failures atomically update shared availability and release only the binding
+    that still points to the failed profile, allowing the Router's next attempt
+    to select another available subscription.
     """
 
     def __init__(
@@ -57,7 +62,7 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
             raise self._service_unavailable(model)
 
         try:
-            selected_profile: Final = await self.store.get_or_assign_profile(
+            selection: Final = await self.store.select_available_profile(
                 user_api_key_hash=user_api_key_hash,
                 available_profile_ids=profile_ids,
                 ttl_seconds=self.ttl_seconds,
@@ -65,14 +70,23 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         except (OpenAISubscriptionAffinityStoreError, ValueError):
             verbose_router_logger.error("OpenAI subscription affinity could not read or assign shared routing state")
             raise self._service_unavailable(model) from None
+        selected_profile: Final = selection.profile_id
+        if selected_profile is None:
+            verbose_router_logger.error(
+                "OpenAI subscription affinity found no profile eligible for normal traffic "
+                "(cooldown=%s, half_open=%s, disabled=%s)",
+                selection.cooldown_profiles,
+                selection.half_open_profiles,
+                selection.disabled_profiles,
+            )
+            raise self._service_unavailable(model)
 
         selected_deployments: Final = [
             deployment for deployment in deployments if self._get_deployment_profile_id(deployment) == selected_profile
         ]
         if not selected_deployments:
-            # A binding can point at a profile that is no longer in the current
-            # healthy set. State-aware failover will handle this in a later step;
-            # until then, never bypass affinity with a random subscription.
+            # The store only returns a profile from this candidate set. Keep a
+            # defensive fail-closed guard in case that contract is ever broken.
             verbose_router_logger.error("OpenAI subscription affinity selected a profile without a healthy deployment")
             raise self._service_unavailable(model)
         return selected_deployments
@@ -93,6 +107,41 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
             # The provider response has already succeeded; affinity maintenance
             # must not turn that response into a client-visible failure.
             verbose_router_logger.error("OpenAI subscription affinity TTL refresh failed after a successful request")
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time) -> None:
+        if not isinstance(kwargs, Mapping):
+            return
+        error: Final = kwargs.get("exception")
+        if not isinstance(error, BaseException):
+            return
+
+        classification: Final = classify_openai_subscription_failure(error)
+        target_state: Final = classification.target_profile_state
+        if not classification.failover_eligible or target_state is None:
+            return
+
+        user_api_key_hash: Final = self._get_user_api_key_hash(kwargs)
+        profile_id: Final = self._get_selected_profile_id(kwargs)
+        if user_api_key_hash is None or profile_id is None:
+            verbose_router_logger.error(
+                "OpenAI subscription affinity could not attribute a profile-scoped failure to trusted routing metadata"
+            )
+            return
+
+        try:
+            update: Final = await self.store.fail_profile_if_current_binding(
+                user_api_key_hash=user_api_key_hash,
+                profile_id=profile_id,
+                target_state=target_state,
+                reason_code=classification.reason_code,
+                reset_at=classification.reset_at,
+            )
+        except (OpenAISubscriptionAffinityStoreError, ValueError):
+            verbose_router_logger.error("OpenAI subscription affinity could not persist a profile-scoped failure")
+            return
+
+        if update.status is OpenAIProfileFailureUpdateStatus.STALE:
+            verbose_router_logger.debug("OpenAI subscription affinity ignored a stale profile-scoped failure")
 
     @staticmethod
     def _get_user_api_key_hash(kwargs: Mapping[str, Any]) -> str | None:

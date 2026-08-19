@@ -20,6 +20,8 @@ import pytest_asyncio
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.router_utils.openai_subscription_affinity import (
+    OpenAIProfileFailureUpdateStatus,
+    OpenAIProfileSelectionStatus,
     OpenAIProfileState,
     OpenAISubscriptionAffinityStore,
     OpenAISubscriptionAffinityStoreError,
@@ -106,7 +108,7 @@ async def test_existing_assignment_and_ttl_are_not_changed(
 
     existing = await affinity_store.get_or_assign_profile(
         user_hash,
-        ["subscription-c", "subscription-d"],
+        ["subscription-a", "subscription-c", "subscription-d"],
         ttl_seconds=60,
     )
     ttl_after = await affinity_store.get_remaining_ttl(user_hash)
@@ -116,6 +118,24 @@ async def test_existing_assignment_and_ttl_are_not_changed(
     assert ttl_after is not None
     assert ttl_after <= ttl_before
     assert ttl_after < 60
+
+
+@pytest.mark.asyncio
+async def test_binding_to_removed_profile_is_reassigned(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(4)
+    await affinity_store.set_profile(user_hash, "subscription-removed", ttl_seconds=300)
+
+    selection = await affinity_store.select_available_profile(
+        user_hash,
+        ["subscription-a", "subscription-b"],
+        ttl_seconds=60,
+    )
+
+    assert selection.status is OpenAIProfileSelectionStatus.REASSIGNED
+    assert selection.profile_id in {"subscription-a", "subscription-b"}
+    assert await affinity_store.get_profile(user_hash) == selection.profile_id
 
 
 @pytest.mark.asyncio
@@ -228,6 +248,195 @@ async def test_expired_binding_can_move_to_newly_added_profile(
 
 
 @pytest.mark.asyncio
+async def test_assignment_excludes_unavailable_states_and_replaces_bound_profile(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(22)
+    await affinity_store.set_profile(user_hash, "subscription-b", ttl_seconds=300)
+    await affinity_store.mark_profile_cooldown(
+        "subscription-b",
+        reset_at=int(time.time()) + 300,
+        reason_code="rate_limit",
+    )
+    await affinity_store.disable_profile("subscription-c", "oauth_error")
+
+    selection = await affinity_store.select_available_profile(
+        user_hash,
+        ["subscription-a", "subscription-b", "subscription-c"],
+        ttl_seconds=60,
+    )
+
+    assert selection.status is OpenAIProfileSelectionStatus.REASSIGNED
+    assert selection.profile_id == "subscription-a"
+    assert await affinity_store.get_profile(user_hash) == "subscription-a"
+    assert await affinity_store.get_remaining_ttl(user_hash) in range(1, 61)
+
+
+@pytest.mark.asyncio
+async def test_assignment_round_robin_is_even_across_only_available_profiles(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    await affinity_store.disable_profile("subscription-b", "oauth_error")
+
+    assigned = [
+        await affinity_store.get_or_assign_profile(
+            _user_hash(index),
+            ["subscription-a", "subscription-b", "subscription-c"],
+            ttl_seconds=60,
+        )
+        for index in range(100, 160)
+    ]
+
+    assert Counter(assigned) == {"subscription-a": 30, "subscription-c": 30}
+
+
+@pytest.mark.asyncio
+async def test_no_available_profile_preserves_binding_and_counter(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(23)
+    await affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=300)
+    reset_at = int(time.time()) + 300
+    await affinity_store.mark_profile_cooldown("subscription-a", reset_at, "rate_limit")
+    await affinity_store.disable_profile("subscription-b", "oauth_error")
+    redis_cache = affinity_store.cache.redis_cache
+    assert redis_cache is not None
+    raw_redis_client = redis_cache.init_async_client()
+
+    selection = await affinity_store.select_available_profile(
+        user_hash,
+        ["subscription-a", "subscription-b"],
+        ttl_seconds=60,
+    )
+
+    assert selection.status is OpenAIProfileSelectionStatus.UNAVAILABLE
+    assert selection.profile_id is None
+    assert selection.cooldown_profiles == 1
+    assert selection.disabled_profiles == 1
+    assert selection.next_recovery_at == reset_at
+    assert await affinity_store.get_profile(user_hash) == "subscription-a"
+    assert await raw_redis_client.exists(affinity_store.COUNTER_CACHE_KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_failure_atomically_updates_state_and_releases_binding(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(24)
+    reset_at = int(time.time()) + 300
+    await affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=300)
+
+    update = await affinity_store.fail_profile_if_current_binding(
+        user_hash,
+        "subscription-a",
+        OpenAIProfileState.COOLDOWN,
+        reset_at=reset_at,
+        reason_code="rate_limit",
+    )
+
+    assert update.status is OpenAIProfileFailureUpdateStatus.APPLIED
+    assert update.effective_state is OpenAIProfileState.COOLDOWN
+    assert await affinity_store.get_profile(user_hash) is None
+    snapshot = await affinity_store.get_profile_state("subscription-a")
+    assert snapshot.state is OpenAIProfileState.COOLDOWN
+    assert snapshot.reset_at == reset_at
+    assert (
+        await affinity_store.get_or_assign_profile(
+            user_hash,
+            ["subscription-a", "subscription-b"],
+            ttl_seconds=60,
+        )
+        == "subscription-b"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delayed_failure_cannot_remove_or_poison_new_binding(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(25)
+    await affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=300)
+    await affinity_store.set_profile(user_hash, "subscription-b", ttl_seconds=300)
+
+    update = await affinity_store.fail_profile_if_current_binding(
+        user_hash,
+        "subscription-a",
+        OpenAIProfileState.DISABLED,
+        reason_code="oauth_error",
+    )
+
+    assert update.status is OpenAIProfileFailureUpdateStatus.STALE
+    assert await affinity_store.get_profile(user_hash) == "subscription-b"
+    assert (await affinity_store.get_profile_state("subscription-a")).persisted is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_failures_for_one_key_have_one_cas_winner(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(26)
+    await affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=300)
+    reset_at = int(time.time()) + 300
+
+    updates = await asyncio.gather(
+        *(
+            affinity_store.fail_profile_if_current_binding(
+                user_hash,
+                "subscription-a",
+                OpenAIProfileState.COOLDOWN,
+                reset_at=reset_at,
+                reason_code="rate_limit",
+            )
+            for _ in range(64)
+        )
+    )
+
+    assert Counter(update.status for update in updates) == {
+        OpenAIProfileFailureUpdateStatus.APPLIED: 1,
+        OpenAIProfileFailureUpdateStatus.STALE: 63,
+    }
+    assert await affinity_store.get_profile(user_hash) is None
+    assert (await affinity_store.get_profile_state("subscription-a")).state is OpenAIProfileState.COOLDOWN
+
+
+@pytest.mark.asyncio
+async def test_many_keys_fail_over_evenly_after_shared_profile_failure(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hashes = [_user_hash(index) for index in range(200, 260)]
+    await asyncio.gather(
+        *(affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=300) for user_hash in user_hashes)
+    )
+    reset_at = int(time.time()) + 300
+
+    updates = await asyncio.gather(
+        *(
+            affinity_store.fail_profile_if_current_binding(
+                user_hash,
+                "subscription-a",
+                OpenAIProfileState.COOLDOWN,
+                reset_at=reset_at,
+                reason_code="rate_limit",
+            )
+            for user_hash in user_hashes
+        )
+    )
+    reassigned = await asyncio.gather(
+        *(
+            affinity_store.get_or_assign_profile(
+                user_hash,
+                ["subscription-a", "subscription-b", "subscription-c"],
+                ttl_seconds=60,
+            )
+            for user_hash in user_hashes
+        )
+    )
+
+    assert all(update.status is OpenAIProfileFailureUpdateStatus.APPLIED for update in updates)
+    assert Counter(reassigned) == {"subscription-b": 30, "subscription-c": 30}
+
+
+@pytest.mark.asyncio
 async def test_success_refresh_extends_only_matching_profile(
     affinity_store: OpenAISubscriptionAffinityStore,
 ) -> None:
@@ -331,6 +540,38 @@ async def test_profile_binding_is_shared_across_model_groups(
     assert first == [gpt_deployments[0]]
     assert second == [codex_deployments[0]]
     assert await affinity_store.get_profile(user_hash) == "subscription-a"
+
+
+@pytest.mark.asyncio
+async def test_failure_callback_makes_next_routing_attempt_use_another_profile(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    callback = OpenAISubscriptionAffinityCheck(store=affinity_store, ttl_seconds=60)
+    user_hash = _user_hash(41)
+    deployments = [
+        {"model_info": {"id": "gpt-a", "openai_oauth_profile": "subscription-a"}},
+        {"model_info": {"id": "gpt-b", "openai_oauth_profile": "subscription-b"}},
+    ]
+    request_kwargs = {"metadata": {"user_api_key_hash": user_hash}}
+    first = await callback.async_filter_deployments("gpt-5.4", deployments, None, request_kwargs)
+    failed_profile = first[0]["model_info"]["openai_oauth_profile"]
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 429  # type: ignore[attr-defined]
+
+    await callback.async_log_failure_event(
+        {
+            "exception": error,
+            "standard_logging_object": {"metadata": {"user_api_key_hash": user_hash}},
+            "litellm_params": {"model_info": {"openai_oauth_profile": failed_profile}},
+        },
+        None,
+        0,
+        1,
+    )
+    second = await callback.async_filter_deployments("gpt-5.4", deployments, None, request_kwargs)
+
+    assert second[0]["model_info"]["openai_oauth_profile"] != failed_profile
+    assert (await affinity_store.get_profile_state(failed_profile)).state is OpenAIProfileState.COOLDOWN
 
 
 @pytest.mark.asyncio
@@ -542,6 +783,12 @@ async def test_corrupted_profile_hash_fails_closed_and_is_not_overwritten(
         await affinity_store.get_profile_state(profile_id)
     with pytest.raises(OpenAISubscriptionAffinityStoreError):
         await affinity_store.mark_profile_available(profile_id)
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await affinity_store.select_available_profile(
+            _user_hash(300),
+            [profile_id, "subscription-b"],
+            ttl_seconds=60,
+        )
 
     assert await raw_redis_client.hget(state_key, "state") == b"cooldown"
     assert await raw_redis_client.hget(state_key, "reason") is None
