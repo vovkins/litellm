@@ -3336,6 +3336,8 @@ class PrometheusLogger(CustomLogger):
         """Publish only fields present in a validated provider observation."""
 
         self._validate_openai_subscription_metric_labels(profile, window)
+        if used_ratio is None and reset_timestamp_seconds is None and window_seconds is None:
+            return
         if not math.isfinite(observed_at) or observed_at <= 0:
             raise ValueError("invalid OpenAI subscription observation timestamp")
         if used_ratio is not None:

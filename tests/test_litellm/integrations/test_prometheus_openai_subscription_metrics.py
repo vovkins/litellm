@@ -106,6 +106,43 @@ def test_observation_sets_only_present_values_and_derived_remaining_ratio() -> N
     assert sample_value("ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds", **labels) == 1700000000.5
 
 
+def test_partial_and_empty_observations_preserve_last_valid_values() -> None:
+    logger = PrometheusLogger()
+    logger.initialize_openai_subscription_profile_metrics(PROFILE, available=True)
+    labels = {"profile": PROFILE, "window": "primary"}
+
+    logger.observe_openai_subscription_limit_window(
+        profile=PROFILE,
+        window="primary",
+        observed_at=1700000000,
+        used_ratio=0.25,
+        reset_timestamp_seconds=1700000300,
+        window_seconds=18000,
+    )
+    logger.observe_openai_subscription_limit_window(
+        profile=PROFILE,
+        window="primary",
+        observed_at=1700000010,
+        used_ratio=0.4,
+        reset_timestamp_seconds=None,
+        window_seconds=None,
+    )
+    logger.observe_openai_subscription_limit_window(
+        profile=PROFILE,
+        window="primary",
+        observed_at=1700000020,
+        used_ratio=None,
+        reset_timestamp_seconds=None,
+        window_seconds=None,
+    )
+
+    assert sample_value("ru_llm_proxy_openai_subscription_limit_used_ratio", **labels) == 0.4
+    assert sample_value("ru_llm_proxy_openai_subscription_limit_remaining_ratio", **labels) == pytest.approx(0.6)
+    assert sample_value("ru_llm_proxy_openai_subscription_limit_reset_timestamp_seconds", **labels) == 1700000300
+    assert sample_value("ru_llm_proxy_openai_subscription_limit_window_seconds", **labels) == 18000
+    assert sample_value("ru_llm_proxy_openai_subscription_last_observation_timestamp_seconds", **labels) == 1700000010
+
+
 def test_profile_state_and_counters_are_updated_independently() -> None:
     logger = PrometheusLogger()
     logger.initialize_openai_subscription_profile_metrics(PROFILE, available=True)

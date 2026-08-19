@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -8,6 +10,41 @@ from litellm.router_utils.openai_subscription_metrics import (
     OpenAISubscriptionLimitObservation,
     extract_openai_subscription_limit_observations,
 )
+
+
+def test_limit_observation_runtime_has_no_network_client_or_usage_endpoint() -> None:
+    runtime_root = Path(__file__).parents[3] / "litellm"
+    runtime_paths = [
+        runtime_root / "router_utils" / "openai_subscription_metrics.py",
+        runtime_root / "router_utils" / "openai_subscription_affinity.py",
+        runtime_root / "router_utils" / "openai_subscription_failure_classifier.py",
+        runtime_root / "router_utils" / "pre_call_checks" / "openai_subscription_affinity_check.py",
+        *sorted((runtime_root / "llms" / "chatgpt").rglob("*.py")),
+    ]
+    forbidden_urls = (
+        "/api/codex/usage",
+        "/backend-api/codex/usage",
+        "/wham/usage",
+        "/account/ratelimits",
+        "/rate_limits/read",
+    )
+
+    for runtime_path in runtime_paths:
+        source = runtime_path.read_text(encoding="utf-8")
+        lowered_source = source.lower()
+        assert all(forbidden_url not in lowered_source for forbidden_url in forbidden_urls)
+
+    observation_tree = ast.parse(runtime_paths[0].read_text(encoding="utf-8"))
+    imported_modules = {
+        node.names[0].name.split(".", maxsplit=1)[0]
+        for node in ast.walk(observation_tree)
+        if isinstance(node, ast.Import)
+    } | {
+        node.module.split(".", maxsplit=1)[0]
+        for node in ast.walk(observation_tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    assert imported_modules.isdisjoint({"aiohttp", "httpx", "requests"})
 
 
 def test_extracts_primary_and_secondary_windows_from_raw_response_headers() -> None:

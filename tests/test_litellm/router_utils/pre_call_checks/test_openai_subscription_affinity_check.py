@@ -955,16 +955,32 @@ async def test_profile_failure_storage_error_is_logged_without_sensitive_values(
     assert PROFILE_ID not in caplog.text
 
 
+@pytest.mark.parametrize("response_shape", ["chat_completions", "responses_api"])
 @pytest.mark.asyncio
-async def test_stream_refreshes_only_after_final_success_event() -> None:
-    callback, refresh = make_callback()
+async def test_stream_observes_limits_only_after_final_success_event(response_shape: str) -> None:
+    metrics_logger = MagicMock()
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
     kwargs = make_success_kwargs()
+    headers = {"x-codex-primary-used-percent": "40"}
+    if response_shape == "chat_completions":
+        final_response = SimpleNamespace(_response_headers=headers)
+    else:
+        final_response = SimpleNamespace(_hidden_params={"additional_headers": headers})
 
-    await callback.async_log_stream_event(kwargs, {"delta": "partial"}, 0, 1)
-    refresh.assert_not_awaited()
+    await callback.async_log_stream_event(
+        kwargs,
+        SimpleNamespace(_response_headers=headers),
+        0,
+        1,
+    )
+    store.refresh_profile_if_current.assert_not_awaited()
+    metrics_logger.observe_openai_subscription_limit_window.assert_not_called()
 
-    await callback.async_log_success_event(kwargs, {"complete": True}, 0, 1)
-    refresh.assert_awaited_once()
+    await callback.async_log_success_event(kwargs, final_response, 0, 1)
+
+    store.refresh_profile_if_current.assert_awaited_once()
+    metrics_logger.observe_openai_subscription_limit_window.assert_called_once()
 
 
 def make_profile_state(state: OpenAIProfileState) -> OpenAIProfileStateSnapshot:
@@ -1074,6 +1090,57 @@ async def test_success_observes_codex_limit_headers_for_both_api_shapes(
             window_seconds=None,
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_missing_limit_headers_do_not_interrupt_routing_or_clear_observations() -> None:
+    metrics_logger = MagicMock()
+    store = MagicMock(spec=OpenAISubscriptionAffinityStore)
+    callback = OpenAISubscriptionAffinityCheck(store=store, metrics_logger=metrics_logger)
+    store.refresh_profile_if_current.return_value = True
+
+    with patch(
+        "litellm.router_utils.pre_call_checks.openai_subscription_affinity_check.time.time",
+        side_effect=[1700000000, 1700000020],
+    ):
+        await callback.async_log_success_event(
+            make_success_kwargs(),
+            SimpleNamespace(_response_headers={"x-codex-primary-used-percent": "25"}),
+            0,
+            1,
+        )
+        await callback.async_log_success_event(
+            make_success_kwargs(),
+            SimpleNamespace(_response_headers={}),
+            0,
+            1,
+        )
+        await callback.async_log_success_event(
+            make_success_kwargs(),
+            SimpleNamespace(_response_headers={"x-codex-primary-used-percent": "50"}),
+            0,
+            1,
+        )
+
+    assert metrics_logger.observe_openai_subscription_limit_window.call_args_list == [
+        call(
+            profile=PROFILE_ID,
+            window="primary",
+            observed_at=1700000000,
+            used_ratio=0.25,
+            reset_timestamp_seconds=None,
+            window_seconds=None,
+        ),
+        call(
+            profile=PROFILE_ID,
+            window="primary",
+            observed_at=1700000020,
+            used_ratio=0.5,
+            reset_timestamp_seconds=None,
+            window_seconds=None,
+        ),
+    ]
+    assert store.refresh_profile_if_current.await_count == 3
 
 
 @pytest.mark.asyncio
