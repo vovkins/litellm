@@ -276,7 +276,12 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
             raw_response_json: Final = raw_response.json()
             raw_response_json["created_at"] = _safe_convert_created_field(raw_response_json["created_at"])
         except Exception:
-            raise OpenAIError(message=raw_response.text, status_code=raw_response.status_code)
+            raise OpenAIError(
+                message=raw_response.text,
+                status_code=raw_response.status_code,
+                headers=raw_response.headers,
+                response=raw_response,
+            )
         raw_response_headers: Final = dict(raw_response.headers)
         processed_headers: Final = process_response_headers(raw_response_headers)
         try:

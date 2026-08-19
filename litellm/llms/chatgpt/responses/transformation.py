@@ -134,6 +134,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             raise OpenAIError(
                 message=error_message or raw_response.text,
                 status_code=raw_response.status_code,
+                headers=raw_response.headers,
+                response=raw_response,
             )
 
         self._attach_response_headers(completed_response=completed_response, raw_response=raw_response)
