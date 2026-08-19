@@ -848,9 +848,14 @@ class Router:
         # Remove ForwardClientSideHeadersByModelGroup if it exists
         if self.optional_callbacks is not None:
             for callback in self.optional_callbacks:
-                litellm.logging_callback_manager.remove_callback_from_list_by_object(
-                    litellm.callbacks, callback, require_self=False
-                )
+                for callback_list in (
+                    litellm.callbacks,
+                    litellm._async_success_callback,
+                    litellm._async_failure_callback,
+                ):
+                    litellm.logging_callback_manager.remove_callback_from_list_by_object(
+                        callback_list, callback, require_self=False
+                    )
 
     @staticmethod
     def _create_redis_cache(
@@ -1709,6 +1714,8 @@ class Router:
                 )
                 self.optional_callbacks.append(openai_affinity)
                 litellm.logging_callback_manager.add_litellm_callback(openai_affinity)
+                litellm.logging_callback_manager.add_litellm_async_success_callback(openai_affinity)
+                litellm.logging_callback_manager.add_litellm_async_failure_callback(openai_affinity)
 
         # ---------------------------------------------------------------------
         # Unified deployment affinity (session stickiness)

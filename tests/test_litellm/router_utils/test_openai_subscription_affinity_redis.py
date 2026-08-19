@@ -766,8 +766,14 @@ async def test_profile_binding_is_shared_across_model_groups(
     first = await callback.async_filter_deployments("gpt-5.4", gpt_deployments, None, request_kwargs)
     second = await callback.async_filter_deployments("gpt-5.3-codex", codex_deployments, None, request_kwargs)
 
-    assert first == [gpt_deployments[0]]
-    assert second == [codex_deployments[0]]
+    assert first[0]["model_info"] == {
+        **gpt_deployments[0]["model_info"],
+        "_openai_subscription_user_api_key_hash": user_hash,
+    }
+    assert second[0]["model_info"] == {
+        **codex_deployments[0]["model_info"],
+        "_openai_subscription_user_api_key_hash": user_hash,
+    }
     assert await affinity_store.get_profile(user_hash) == "subscription-a"
 
 

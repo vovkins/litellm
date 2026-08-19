@@ -34,6 +34,7 @@ from litellm.types.llms.openai import AllMessageValues
 
 _PROBE_HANDLE_PATTERN: Final = re.compile(r"^[0-9a-f]{32}$")
 _PROBE_HANDLE_MODEL_INFO_KEY: Final = "_openai_subscription_probe_handle"
+_USER_KEY_HASH_MODEL_INFO_KEY: Final = "_openai_subscription_user_api_key_hash"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,14 +181,26 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
         lease: Final = selection.half_open_lease
         if lease is None:
             self._set_profile_available_metric(selected_profile, True)
-            return [self._copy_deployment_with_probe_handle(deployment, None) for deployment in selected_deployments]
+            return [
+                self._copy_deployment_with_routing_context(
+                    deployment,
+                    probe_handle=None,
+                    user_api_key_hash=user_api_key_hash,
+                )
+                for deployment in selected_deployments
+            ]
         self._set_profile_available_metric(selected_profile, False)
         probe_handle: Final = self._remember_probe_context(
             user_api_key_hash=user_api_key_hash,
             lease=lease,
         )
         return [
-            self._copy_deployment_with_probe_handle(deployment, probe_handle) for deployment in selected_deployments
+            self._copy_deployment_with_routing_context(
+                deployment,
+                probe_handle=probe_handle,
+                user_api_key_hash=user_api_key_hash,
+            )
+            for deployment in selected_deployments
         ]
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time) -> None:
@@ -473,13 +486,15 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
             self._probe_contexts.pop(handle, None)
 
     @staticmethod
-    def _copy_deployment_with_probe_handle(
+    def _copy_deployment_with_routing_context(
         deployment: Mapping[str, Any],
         probe_handle: str | None,
+        user_api_key_hash: str,
     ) -> dict:
         copied_deployment: Final = dict(deployment)
         model_info: Final = dict(deployment.get("model_info") or {})
         model_info.pop(_PROBE_HANDLE_MODEL_INFO_KEY, None)
+        model_info[_USER_KEY_HASH_MODEL_INFO_KEY] = user_api_key_hash
         if probe_handle is not None:
             model_info[_PROBE_HANDLE_MODEL_INFO_KEY] = probe_handle
         copied_deployment["model_info"] = model_info
@@ -488,12 +503,20 @@ class OpenAISubscriptionAffinityCheck(CustomLogger):
     @staticmethod
     def _get_user_api_key_hash(kwargs: Mapping[str, Any]) -> str | None:
         standard_logging_object: Final = kwargs.get("standard_logging_object")
-        if not isinstance(standard_logging_object, Mapping):
+        if isinstance(standard_logging_object, Mapping):
+            metadata: Final = standard_logging_object.get("metadata")
+            if isinstance(metadata, Mapping):
+                user_api_key_hash: Final = metadata.get("user_api_key_hash")
+                if isinstance(user_api_key_hash, str):
+                    return user_api_key_hash
+
+        litellm_params: Final = kwargs.get("litellm_params")
+        if not isinstance(litellm_params, Mapping):
             return None
-        metadata: Final = standard_logging_object.get("metadata")
-        if not isinstance(metadata, Mapping):
+        model_info: Final = litellm_params.get("model_info")
+        if not isinstance(model_info, Mapping):
             return None
-        user_api_key_hash: Final = metadata.get("user_api_key_hash")
+        user_api_key_hash = model_info.get(_USER_KEY_HASH_MODEL_INFO_KEY)
         return user_api_key_hash if isinstance(user_api_key_hash, str) else None
 
     @staticmethod

@@ -77,6 +77,7 @@ def _iter_header_sources(
         yield _safe_getattr(_safe_getattr(error, "response"), "headers")
 
     if kwargs is not None:
+        yield kwargs.get("response_headers")
         yield from _iter_hidden_header_sources(kwargs.get("standard_logging_object"))
 
 

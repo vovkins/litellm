@@ -15,8 +15,8 @@ import pytest
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils import thread_pool_executor as thread_pool_executor_module
-from litellm.responses import streaming_iterator as responses_streaming_iterator_module
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
+from litellm.responses import streaming_iterator as responses_streaming_iterator_module
 from litellm.responses.streaming_iterator import ResponsesAPIStreamingIterator
 from litellm.types.llms.openai import ResponsesAPIResponse
 
@@ -95,7 +95,10 @@ def _make_logging_obj() -> LitellmLogging:
 
 def _make_iterator(logging_obj: LitellmLogging) -> ResponsesAPIStreamingIterator:
     iterator = ResponsesAPIStreamingIterator(
-        response=httpx.Response(200),
+        response=httpx.Response(
+            200,
+            headers={"x-codex-primary-used-percent": "25"},
+        ),
         model="gpt-5.4-nano",
         responses_api_provider_config=None,
         logging_obj=logging_obj,
@@ -117,6 +120,17 @@ def _make_iterator(logging_obj: LitellmLogging) -> ResponsesAPIStreamingIterator
         top_p=1.0,
     )
     return iterator
+
+
+@pytest.mark.asyncio
+async def test_completed_response_preserves_provider_headers_for_callbacks(recording_executor):
+    logging_obj = _make_logging_obj()
+    iterator = _make_iterator(logging_obj)
+
+    iterator._log_completed_response(is_async=True)
+    await asyncio.sleep(0.1)
+
+    assert logging_obj.model_call_details["response_headers"]["x-codex-primary-used-percent"] == "25"
 
 
 @pytest.mark.asyncio

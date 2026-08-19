@@ -381,6 +381,14 @@ class BaseResponsesAPIStreamingIterator:
                 # Fallback to original if serialization fails
                 pass
 
+        logging_hidden_params = getattr(logging_response, "_hidden_params", None)
+        if isinstance(logging_hidden_params, dict):
+            logging_hidden_params["headers"] = dict(self.response.headers)
+            additional_headers = self._hidden_params.get("additional_headers")
+            if isinstance(additional_headers, Mapping):
+                logging_hidden_params["additional_headers"] = dict(additional_headers)
+        self.logging_obj.model_call_details["response_headers"] = dict(self.response.headers)
+
         end_time: Final = datetime.now()
         if is_async:
             asyncio.create_task(

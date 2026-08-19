@@ -124,7 +124,11 @@ async def test_routing_filters_oauth_deployments_to_assigned_profile() -> None:
         request_kwargs=make_request_kwargs(),
     )
 
-    assert filtered == [deployments[1]]
+    assert filtered[0]["model_info"] == {
+        **deployments[1]["model_info"],
+        "_openai_subscription_user_api_key_hash": USER_KEY_HASH,
+    }
+    assert "_openai_subscription_user_api_key_hash" not in deployments[1]["model_info"]
     store.select_available_profile.assert_awaited_once_with(
         user_api_key_hash=USER_KEY_HASH,
         available_profile_ids=[PROFILE_ID, SECOND_PROFILE_ID],
@@ -149,6 +153,7 @@ async def test_reserved_probe_handle_is_replaced_only_for_real_probe() -> None:
     )
 
     assert "_openai_subscription_probe_handle" not in filtered[0]["model_info"]
+    assert filtered[0]["model_info"]["_openai_subscription_user_api_key_hash"] == USER_KEY_HASH
     assert deployment["model_info"]["_openai_subscription_probe_handle"] == "a" * 32
 
 
@@ -168,8 +173,10 @@ async def test_one_binding_is_used_across_openai_model_groups() -> None:
     first = await callback.async_filter_deployments("gpt-5.4", gpt_deployments, None, make_request_kwargs())
     second = await callback.async_filter_deployments("gpt-5.3-codex", codex_deployments, None, make_request_kwargs())
 
-    assert first == [gpt_deployments[0]]
-    assert second == [codex_deployments[0]]
+    assert first[0]["model_info"]["id"] == gpt_deployments[0]["model_info"]["id"]
+    assert second[0]["model_info"]["id"] == codex_deployments[0]["model_info"]["id"]
+    assert first[0]["model_info"]["_openai_subscription_user_api_key_hash"] == USER_KEY_HASH
+    assert second[0]["model_info"]["_openai_subscription_user_api_key_hash"] == USER_KEY_HASH
     assert [call.kwargs["user_api_key_hash"] for call in store.select_available_profile.await_args_list] == [
         USER_KEY_HASH,
         USER_KEY_HASH,
@@ -220,7 +227,10 @@ async def test_responses_metadata_can_supply_virtual_key_hash() -> None:
         {"litellm_metadata": {"user_api_key_hash": USER_KEY_HASH}},
     )
 
-    assert filtered == deployments
+    assert filtered[0]["model_info"] == {
+        **deployments[0]["model_info"],
+        "_openai_subscription_user_api_key_hash": USER_KEY_HASH,
+    }
 
 
 @pytest.mark.parametrize(
@@ -491,6 +501,8 @@ async def test_router_registers_and_separates_openai_and_glm_affinity() -> None:
         assert callbacks.index(openai_callbacks[0]) < callbacks.index(deployment_callback)
         assert litellm.callbacks.index(openai_callbacks[0]) < litellm.callbacks.index(deployment_callback)
         assert openai_callbacks[0].router is router
+        assert openai_callbacks[0] in litellm._async_success_callback
+        assert openai_callbacks[0] in litellm._async_failure_callback
         assert deployment_callback.enable_user_key_affinity is False
         assert deployment_callback._get_effective_flags("glm-5.2") == (True, False, False)
         assert deployment_callback._get_effective_flags("gpt-5.4") == (False, False, False)
@@ -521,12 +533,23 @@ async def test_router_registers_and_separates_openai_and_glm_affinity() -> None:
             request_kwargs=make_request_kwargs(),
         )
 
-        assert filtered_oauth == [oauth_deployments[1]]
+        assert filtered_oauth[0]["model_info"] == {
+            **oauth_deployments[1]["model_info"],
+            "_openai_subscription_user_api_key_hash": USER_KEY_HASH,
+        }
         assert filtered_glm == glm_deployments
         openai_callback.store.select_available_profile.assert_awaited_once()
     finally:
         if router is not None:
+            registered_openai_callbacks = [
+                callback
+                for callback in (router.optional_callbacks or [])
+                if isinstance(callback, OpenAISubscriptionAffinityCheck)
+            ]
             router.discard()
+            for callback in registered_openai_callbacks:
+                assert callback not in litellm._async_success_callback
+                assert callback not in litellm._async_failure_callback
         litellm.callbacks = original_callbacks
 
 
@@ -617,6 +640,22 @@ async def test_success_refreshes_selected_profile_binding() -> None:
     refresh.return_value = True
 
     await callback.async_log_success_event(make_success_kwargs(), {}, 0, 1)
+
+    refresh.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        profile_id=PROFILE_ID,
+        ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
+    )
+
+
+@pytest.mark.asyncio
+async def test_success_uses_trusted_routing_hash_when_stream_logging_omits_metadata() -> None:
+    callback, refresh = make_callback()
+    refresh.return_value = True
+    kwargs = make_success_kwargs(user_api_key_hash=None)
+    kwargs["litellm_params"]["model_info"]["_openai_subscription_user_api_key_hash"] = USER_KEY_HASH
+
+    await callback.async_log_success_event(kwargs, {}, 0, 1)
 
     refresh.assert_awaited_once_with(
         user_api_key_hash=USER_KEY_HASH,
@@ -1231,5 +1270,8 @@ async def test_metrics_failures_do_not_change_routing_or_provider_result() -> No
         1,
     )
 
-    assert filtered == deployments
+    assert filtered[0]["model_info"] == {
+        **deployments[0]["model_info"],
+        "_openai_subscription_user_api_key_hash": USER_KEY_HASH,
+    }
     store.refresh_profile_if_current.assert_awaited_once()

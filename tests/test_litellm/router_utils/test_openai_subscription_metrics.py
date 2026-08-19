@@ -105,6 +105,27 @@ def test_extracts_processed_headers_from_standard_logging_payload() -> None:
     )
 
 
+def test_extracts_headers_preserved_in_streaming_model_call_details() -> None:
+    kwargs = {
+        "response_headers": {
+            "x-codex-primary-used-percent": "55",
+            "x-codex-primary-reset-at": "1700000300",
+        }
+    }
+
+    assert extract_openai_subscription_limit_observations(
+        kwargs=kwargs,
+        response_obj={},
+    ) == (
+        OpenAISubscriptionLimitObservation(
+            window="primary",
+            used_ratio=0.55,
+            reset_timestamp_seconds=1700000300,
+            window_seconds=None,
+        ),
+    )
+
+
 def test_extracts_failure_headers_from_mapped_exception() -> None:
     error = RuntimeError("provider body is not inspected")
     error.response = httpx.Response(  # type: ignore[attr-defined]
