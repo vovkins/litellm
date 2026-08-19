@@ -33,6 +33,18 @@ if operation == 'delete' then
   return {'deleted', tostring(redis.call('DEL', KEYS[1]))}
 end
 
+if operation == 'refresh_if_current' then
+  local current = redis.call('GET', KEYS[1])
+  if current == false then
+    return {'missing'}
+  end
+  if current ~= ARGV[2] then
+    return {'mismatch'}
+  end
+  redis.call('EXPIRE', KEYS[1], ARGV[3])
+  return {'refreshed'}
+end
+
 return redis.error_reply('unsupported affinity store operation')
 """
 
@@ -125,6 +137,33 @@ class OpenAISubscriptionAffinityStore:
         response: Final = await self._execute(_AFFINITY_STORE_SCRIPT, (cache_key,), ("delete",))
         if len(response) != 2 or response[0] != "deleted" or response[1] not in {"0", "1"}:
             raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity delete returned invalid data")
+
+    async def refresh_profile_if_current(
+        self,
+        user_api_key_hash: str,
+        profile_id: str,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> bool:
+        """Refresh a binding only if it still points to the successful profile.
+
+        The comparison and expiry update run in one Redis script. A delayed
+        success from an old profile therefore cannot overwrite or extend a newer
+        binding, and an expired binding is never recreated by this operation.
+        """
+
+        cache_key: Final = self.get_cache_key(user_api_key_hash)
+        validated_profile_id: Final = self._validate_profile_id(profile_id)
+        validated_ttl: Final = self._validate_ttl(ttl_seconds)
+        response: Final = await self._execute(
+            _AFFINITY_STORE_SCRIPT,
+            (cache_key,),
+            ("refresh_if_current", validated_profile_id, str(validated_ttl)),
+        )
+        if response == ("refreshed",):
+            return True
+        if response in {("missing",), ("mismatch",)}:
+            return False
+        raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity refresh returned invalid data")
 
     async def get_remaining_ttl(self, user_api_key_hash: str) -> int | None:
         snapshot: Final = await self._read_snapshot(user_api_key_hash)

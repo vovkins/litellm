@@ -219,3 +219,85 @@ async def test_expired_binding_can_move_to_newly_added_profile(
         )
         == "subscription-c"
     )
+
+
+@pytest.mark.asyncio
+async def test_success_refresh_extends_only_matching_profile(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(30)
+    await affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=5)
+
+    assert (
+        await affinity_store.refresh_profile_if_current(
+            user_hash,
+            "subscription-a",
+            ttl_seconds=60,
+        )
+        is True
+    )
+    assert await affinity_store.get_profile(user_hash) == "subscription-a"
+    assert await affinity_store.get_remaining_ttl(user_hash) in range(59, 61)
+
+
+@pytest.mark.asyncio
+async def test_success_refresh_does_not_change_mismatched_profile_or_ttl(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(31)
+    await affinity_store.set_profile(user_hash, "subscription-b", ttl_seconds=5)
+    ttl_before = await affinity_store.get_remaining_ttl(user_hash)
+
+    assert (
+        await affinity_store.refresh_profile_if_current(
+            user_hash,
+            "subscription-a",
+            ttl_seconds=60,
+        )
+        is False
+    )
+    ttl_after = await affinity_store.get_remaining_ttl(user_hash)
+
+    assert await affinity_store.get_profile(user_hash) == "subscription-b"
+    assert ttl_before is not None
+    assert ttl_after is not None
+    assert ttl_after <= ttl_before
+    assert ttl_after < 60
+
+
+@pytest.mark.asyncio
+async def test_success_refresh_does_not_recreate_missing_binding(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(32)
+
+    assert (
+        await affinity_store.refresh_profile_if_current(
+            user_hash,
+            "subscription-a",
+            ttl_seconds=60,
+        )
+        is False
+    )
+    assert await affinity_store.get_profile(user_hash) is None
+
+
+@pytest.mark.asyncio
+async def test_delayed_success_cannot_extend_newer_profile_binding(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(33)
+    await affinity_store.set_profile(user_hash, "subscription-a", ttl_seconds=60)
+
+    await affinity_store.set_profile(user_hash, "subscription-b", ttl_seconds=5)
+    assert (
+        await affinity_store.refresh_profile_if_current(
+            user_hash,
+            "subscription-a",
+            ttl_seconds=300,
+        )
+        is False
+    )
+
+    assert await affinity_store.get_profile(user_hash) == "subscription-b"
+    assert await affinity_store.get_remaining_ttl(user_hash) in range(1, 6)

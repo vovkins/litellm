@@ -112,6 +112,57 @@ async def test_delete_profile_removes_shared_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_profile_if_current_extends_matching_binding() -> None:
+    store, script = make_store([b"refreshed"])
+
+    assert await store.refresh_profile_if_current(USER_KEY_HASH, PROFILE_ID, ttl_seconds=86400) is True
+    script.assert_awaited_once_with(
+        keys=(AFFINITY_KEY,),
+        args=("refresh_if_current", PROFILE_ID, "86400"),
+        client=None,
+    )
+
+
+@pytest.mark.parametrize("response", [[b"missing"], [b"mismatch"]])
+@pytest.mark.asyncio
+async def test_refresh_profile_if_current_does_not_recreate_or_replace_binding(response: object) -> None:
+    store, _ = make_store(response)
+
+    assert await store.refresh_profile_if_current(USER_KEY_HASH, PROFILE_ID, ttl_seconds=86400) is False
+
+
+@pytest.mark.parametrize("response", [None, [b"unexpected"], [b"refreshed", b"extra"]])
+@pytest.mark.asyncio
+async def test_refresh_profile_if_current_fails_closed_on_malformed_result(response: object) -> None:
+    store, _ = make_store(response)
+
+    with pytest.raises(OpenAISubscriptionAffinityStoreError):
+        await store.refresh_profile_if_current(USER_KEY_HASH, PROFILE_ID, ttl_seconds=86400)
+
+
+@pytest.mark.parametrize(
+    ("user_hash", "profile_id", "ttl_seconds", "error"),
+    [
+        ("not-a-hash", PROFILE_ID, 60, "SHA-256"),
+        (USER_KEY_HASH, "UNSAFE", 60, "profile_id"),
+        (USER_KEY_HASH, PROFILE_ID, 0, "ttl_seconds"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_refresh_profile_if_current_validates_inputs(
+    user_hash: str,
+    profile_id: str,
+    ttl_seconds: int,
+    error: str,
+) -> None:
+    store, script = make_store([b"refreshed"])
+
+    with pytest.raises(ValueError, match=error):
+        await store.refresh_profile_if_current(user_hash, profile_id, ttl_seconds=ttl_seconds)
+    script.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_get_remaining_ttl_uses_same_atomic_snapshot() -> None:
     store, _ = make_store([b"found", PROFILE_ID.encode(), b"321"])
 
