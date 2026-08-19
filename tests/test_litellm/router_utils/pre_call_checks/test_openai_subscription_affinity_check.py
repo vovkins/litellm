@@ -10,6 +10,9 @@ from litellm.exceptions import ServiceUnavailableError
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileFailureUpdate,
     OpenAIProfileFailureUpdateStatus,
+    OpenAIProfileHalfOpenLease,
+    OpenAIProfileProbeBindingAction,
+    OpenAIProfileProbeCompletion,
     OpenAIProfileSelection,
     OpenAIProfileSelectionStatus,
     OpenAIProfileState,
@@ -61,6 +64,46 @@ def make_selection(profile_id: str) -> OpenAIProfileSelection:
     )
 
 
+def make_probe_selection(profile_id: str = PROFILE_ID, token: str = "f" * 32) -> OpenAIProfileSelection:
+    return OpenAIProfileSelection(
+        status=OpenAIProfileSelectionStatus.PROBE_ASSIGNED,
+        profile_id=profile_id,
+        remaining_ttl_seconds=60,
+        half_open_lease=OpenAIProfileHalfOpenLease(
+            profile_id=profile_id,
+            token=token,
+            expires_at=1700000030,
+        ),
+    )
+
+
+async def route_recovery_probe(
+    callback: OpenAISubscriptionAffinityCheck,
+    store: MagicMock,
+    *,
+    token: str = "f" * 32,
+) -> str:
+    store.select_available_profile.return_value = make_probe_selection(token=token)
+    deployments = [
+        make_deployment("gpt-5.4", "deployment-a", PROFILE_ID),
+        make_deployment("gpt-5.4", "deployment-b", SECOND_PROFILE_ID),
+    ]
+
+    filtered = await callback.async_filter_deployments(
+        "gpt-5.4",
+        deployments,
+        None,
+        make_request_kwargs(),
+    )
+
+    assert len(filtered) == 1
+    assert "_openai_subscription_probe_handle" not in deployments[0]["model_info"]
+    assert token not in repr(filtered)
+    probe_handle = filtered[0]["model_info"]["_openai_subscription_probe_handle"]
+    assert isinstance(probe_handle, str)
+    return probe_handle
+
+
 @pytest.mark.asyncio
 async def test_routing_filters_oauth_deployments_to_assigned_profile() -> None:
     callback, store = make_routing_callback()
@@ -82,7 +125,27 @@ async def test_routing_filters_oauth_deployments_to_assigned_profile() -> None:
         user_api_key_hash=USER_KEY_HASH,
         available_profile_ids=[PROFILE_ID, SECOND_PROFILE_ID],
         ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
+        allow_recovery_probe=True,
+        half_open_lease_seconds=OpenAISubscriptionAffinityStore.DEFAULT_HALF_OPEN_LEASE_SECONDS,
     )
+
+
+@pytest.mark.asyncio
+async def test_reserved_probe_handle_is_replaced_only_for_real_probe() -> None:
+    callback, store = make_routing_callback()
+    store.select_available_profile.return_value = make_selection(PROFILE_ID)
+    deployment = make_deployment("gpt-5.4", "deployment-a", PROFILE_ID)
+    deployment["model_info"]["_openai_subscription_probe_handle"] = "a" * 32
+
+    filtered = await callback.async_filter_deployments(
+        "gpt-5.4",
+        [deployment],
+        None,
+        make_request_kwargs(),
+    )
+
+    assert "_openai_subscription_probe_handle" not in filtered[0]["model_info"]
+    assert deployment["model_info"]["_openai_subscription_probe_handle"] == "a" * 32
 
 
 @pytest.mark.asyncio
@@ -307,13 +370,17 @@ def make_success_kwargs(
     *,
     user_api_key_hash: object = USER_KEY_HASH,
     profile_id: object = PROFILE_ID,
+    probe_handle: object = None,
 ) -> dict:
+    model_info = {"openai_oauth_profile": profile_id}
+    if probe_handle is not None:
+        model_info["_openai_subscription_probe_handle"] = probe_handle
     return {
         "standard_logging_object": {
             "metadata": {"user_api_key_hash": user_api_key_hash},
         },
         "litellm_params": {
-            "model_info": {"openai_oauth_profile": profile_id},
+            "model_info": model_info,
         },
     }
 
@@ -330,6 +397,46 @@ async def test_success_refreshes_selected_profile_binding() -> None:
         profile_id=PROFILE_ID,
         ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
     )
+
+
+@pytest.mark.asyncio
+async def test_successful_recovery_probe_marks_profile_available_and_refreshes_binding() -> None:
+    callback, store = make_routing_callback()
+    probe_handle = await route_recovery_probe(callback, store)
+    store.complete_profile_probe_for_binding.return_value = OpenAIProfileProbeCompletion(
+        applied=True,
+        binding_action=OpenAIProfileProbeBindingAction.REFRESHED,
+    )
+
+    await callback.async_log_success_event(
+        make_success_kwargs(probe_handle=probe_handle),
+        {},
+        0,
+        1,
+    )
+
+    store.complete_profile_probe_for_binding.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        profile_id=PROFILE_ID,
+        lease_token="f" * 32,
+        target_state=OpenAIProfileState.AVAILABLE,
+        ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
+    )
+    store.refresh_profile_if_current.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_successful_recovery_probe_does_not_refresh_binding() -> None:
+    callback, store = make_routing_callback()
+    probe_handle = await route_recovery_probe(callback, store)
+    store.complete_profile_probe_for_binding.return_value = OpenAIProfileProbeCompletion(
+        applied=False,
+        binding_action=None,
+    )
+
+    await callback.async_log_success_event(make_success_kwargs(probe_handle=probe_handle), {}, 0, 1)
+
+    store.refresh_profile_if_current.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -432,6 +539,107 @@ async def test_rate_limit_failure_moves_current_profile_to_cooldown(
         reason_code="rate_limit",
         reset_at=1700000120,
     )
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_recovery_probe_returns_profile_to_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback, store = make_routing_callback()
+    probe_handle = await route_recovery_probe(callback, store)
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 429  # type: ignore[attr-defined]
+    error.headers = {"Retry-After": "120"}  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "litellm.router_utils.openai_subscription_failure_classifier.time.time",
+        lambda: 1700000000,
+    )
+    store.complete_profile_probe_for_binding.return_value = OpenAIProfileProbeCompletion(
+        applied=True,
+        binding_action=OpenAIProfileProbeBindingAction.RELEASED,
+    )
+
+    await callback.async_log_failure_event(
+        make_failure_kwargs(error, probe_handle=probe_handle),
+        {},
+        0,
+        1,
+    )
+
+    store.complete_profile_probe_for_binding.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        profile_id=PROFILE_ID,
+        lease_token="f" * 32,
+        target_state=OpenAIProfileState.COOLDOWN,
+        reason_code="rate_limit",
+        reset_at=1700000120,
+        ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
+    )
+    store.fail_profile_if_current_binding.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_during_recovery_probe_disables_profile() -> None:
+    callback, store = make_routing_callback()
+    probe_handle = await route_recovery_probe(callback, store)
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 401  # type: ignore[attr-defined]
+    store.complete_profile_probe_for_binding.return_value = OpenAIProfileProbeCompletion(
+        applied=True,
+        binding_action=OpenAIProfileProbeBindingAction.RELEASED,
+    )
+
+    await callback.async_log_failure_event(
+        make_failure_kwargs(error, probe_handle=probe_handle),
+        {},
+        0,
+        1,
+    )
+
+    store.complete_profile_probe_for_binding.assert_awaited_once_with(
+        user_api_key_hash=USER_KEY_HASH,
+        profile_id=PROFILE_ID,
+        lease_token="f" * 32,
+        target_state=OpenAIProfileState.DISABLED,
+        reason_code="oauth_error",
+        reset_at=None,
+        ttl_seconds=OpenAISubscriptionAffinityStore.DEFAULT_TTL_SECONDS,
+    )
+
+
+@pytest.mark.parametrize("status_code", [404, 500])
+@pytest.mark.asyncio
+async def test_non_profile_recovery_failure_leaves_lease_to_expire(status_code: int) -> None:
+    callback, store = make_routing_callback()
+    probe_handle = await route_recovery_probe(callback, store)
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = status_code  # type: ignore[attr-defined]
+
+    await callback.async_log_failure_event(
+        make_failure_kwargs(error, probe_handle=probe_handle),
+        {},
+        0,
+        1,
+    )
+
+    store.complete_profile_probe_for_binding.assert_not_awaited()
+    store.fail_profile_if_current_binding.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_probe_context_cannot_be_reused_by_duplicate_callback() -> None:
+    callback, store = make_routing_callback()
+    probe_handle = await route_recovery_probe(callback, store)
+    store.complete_profile_probe_for_binding.return_value = OpenAIProfileProbeCompletion(
+        applied=True,
+        binding_action=OpenAIProfileProbeBindingAction.REFRESHED,
+    )
+    kwargs = make_success_kwargs(probe_handle=probe_handle)
+
+    await callback.async_log_success_event(kwargs, {}, 0, 1)
+    await callback.async_log_success_event(kwargs, {}, 0, 1)
+
+    store.complete_profile_probe_for_binding.assert_awaited_once()
 
 
 @pytest.mark.parametrize("status_code", [401, 403])

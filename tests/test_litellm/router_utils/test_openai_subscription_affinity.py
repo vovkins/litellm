@@ -9,6 +9,7 @@ from litellm.caching.dual_cache import DualCache
 from litellm.router_utils.openai_subscription_affinity import (
     OpenAIProfileFailureUpdateStatus,
     OpenAIProfileHalfOpenLease,
+    OpenAIProfileProbeBindingAction,
     OpenAIProfileSelectionStatus,
     OpenAIProfileState,
     OpenAIProfileStateSnapshot,
@@ -198,7 +199,7 @@ async def test_get_or_assign_profile_normalizes_profiles_and_uses_shared_counter
     assert profile_id == "subscription-a"
     script.assert_awaited_once_with(
         keys=(AFFINITY_KEY, COUNTER_KEY, SUBSCRIPTION_A_STATE_KEY, SUBSCRIPTION_B_STATE_KEY),
-        args=("86400", "2", "subscription-a", "subscription-b"),
+        args=("86400", "2", "0", "", "30", "subscription-a", "subscription-b"),
         client=None,
     )
 
@@ -223,7 +224,16 @@ async def test_adding_profile_preserves_existing_binding() -> None:
             SUBSCRIPTION_B_STATE_KEY,
             SUBSCRIPTION_C_STATE_KEY,
         ),
-        args=("86400", "3", "subscription-a", "subscription-b", "subscription-c"),
+        args=(
+            "86400",
+            "3",
+            "0",
+            "",
+            "30",
+            "subscription-a",
+            "subscription-b",
+            "subscription-c",
+        ),
         client=None,
     )
 
@@ -310,6 +320,143 @@ async def test_state_aware_assignment_fails_closed_on_invalid_result(response: o
             ["subscription-a", "subscription-b"],
             ttl_seconds=60,
         )
+
+
+@pytest.mark.asyncio
+async def test_recovery_assignment_returns_private_half_open_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, script = make_store([b"probe_assigned", b"subscription-a", b"60", b"1700000030"])
+    monkeypatch.setattr(
+        "litellm.router_utils.openai_subscription_affinity.secrets.token_hex",
+        lambda _: "d" * 32,
+    )
+
+    selection = await store.select_available_profile(
+        USER_KEY_HASH,
+        ["subscription-b", "subscription-a"],
+        ttl_seconds=60,
+        allow_recovery_probe=True,
+        half_open_lease_seconds=30,
+    )
+
+    assert selection.status is OpenAIProfileSelectionStatus.PROBE_ASSIGNED
+    assert selection.profile_id == "subscription-a"
+    assert selection.half_open_lease == OpenAIProfileHalfOpenLease(
+        profile_id="subscription-a",
+        token="d" * 32,
+        expires_at=1700000030,
+    )
+    assert "d" * 32 not in repr(selection)
+    script.assert_awaited_once_with(
+        keys=(AFFINITY_KEY, COUNTER_KEY, SUBSCRIPTION_A_STATE_KEY, SUBSCRIPTION_B_STATE_KEY),
+        args=("60", "2", "1", "d" * 32, "30", "subscription-a", "subscription-b"),
+        client=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("allow_recovery_probe", "lease_seconds", "message"),
+    [
+        ("yes", 30, "allow_recovery_probe"),
+        (True, 0, "lease_seconds"),
+        (True, 3601, "lease_seconds"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recovery_assignment_rejects_invalid_contract(
+    allow_recovery_probe: Any,
+    lease_seconds: int,
+    message: str,
+) -> None:
+    store, script = make_store([b"assigned", b"subscription-a", b"60"])
+
+    with pytest.raises(ValueError, match=message):
+        await store.select_available_profile(
+            USER_KEY_HASH,
+            ["subscription-a"],
+            ttl_seconds=60,
+            allow_recovery_probe=allow_recovery_probe,
+            half_open_lease_seconds=lease_seconds,
+        )
+    script.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("target_state", "reset_at", "reason_code", "response", "expected_action"),
+    [
+        (
+            OpenAIProfileState.AVAILABLE,
+            None,
+            None,
+            [b"applied", b"refreshed"],
+            OpenAIProfileProbeBindingAction.REFRESHED,
+        ),
+        (
+            OpenAIProfileState.COOLDOWN,
+            1700000200,
+            "rate_limit",
+            [b"applied", b"released"],
+            OpenAIProfileProbeBindingAction.RELEASED,
+        ),
+        (
+            OpenAIProfileState.DISABLED,
+            None,
+            "oauth_error",
+            [b"applied", b"unchanged"],
+            OpenAIProfileProbeBindingAction.UNCHANGED,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_probe_completion_updates_state_and_binding_atomically(
+    target_state: OpenAIProfileState,
+    reset_at: int | None,
+    reason_code: str | None,
+    response: object,
+    expected_action: OpenAIProfileProbeBindingAction,
+) -> None:
+    store, script = make_store(response)
+
+    completion = await store.complete_profile_probe_for_binding(
+        USER_KEY_HASH,
+        PROFILE_ID,
+        "e" * 32,
+        target_state,
+        ttl_seconds=60,
+        reset_at=reset_at,
+        reason_code=reason_code,
+    )
+
+    assert completion.applied is True
+    assert completion.binding_action is expected_action
+    script.assert_awaited_once_with(
+        keys=(PROFILE_STATE_KEY, AFFINITY_KEY),
+        args=(
+            PROFILE_ID,
+            "e" * 32,
+            target_state.value,
+            str(reset_at) if reset_at is not None else "",
+            reason_code or "",
+            "60",
+        ),
+        client=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_completion_rejects_stale_lease() -> None:
+    store, _ = make_store([b"stale"])
+
+    completion = await store.complete_profile_probe_for_binding(
+        USER_KEY_HASH,
+        PROFILE_ID,
+        "e" * 32,
+        OpenAIProfileState.AVAILABLE,
+    )
+
+    assert completion.applied is False
+    assert completion.binding_action is None
 
 
 @pytest.mark.parametrize(

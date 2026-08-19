@@ -143,10 +143,21 @@ _ASSIGN_PROFILE_SCRIPT: Final = (
     + """
 local ttl = tonumber(ARGV[1])
 local profile_count = tonumber(ARGV[2])
-if ttl == nil or ttl <= 0 or profile_count == nil or profile_count <= 0 then
+local allow_recovery_probe = ARGV[3]
+local lease_token = ARGV[4]
+local lease_seconds = tonumber(ARGV[5])
+if ttl == nil or ttl <= 0 or profile_count == nil or profile_count <= 0
+  or (allow_recovery_probe ~= '0' and allow_recovery_probe ~= '1') then
   return redis.error_reply('invalid affinity assignment arguments')
 end
-if #KEYS ~= profile_count + 2 or #ARGV ~= profile_count + 2 then
+if allow_recovery_probe == '1'
+  and (not is_lease_token(lease_token) or lease_seconds == nil or lease_seconds <= 0 or lease_seconds > 3600) then
+  return redis.error_reply('invalid affinity recovery lease arguments')
+end
+if allow_recovery_probe == '0' and lease_token ~= '' then
+  return redis.error_reply('unexpected affinity recovery lease token')
+end
+if #KEYS ~= profile_count + 2 or #ARGV ~= profile_count + 5 then
   return redis.error_reply('invalid affinity assignment shape')
 end
 
@@ -163,14 +174,16 @@ if current ~= false then
 end
 
 local eligible = {}
+local recoverable = {}
 local current_is_available = false
 local cooldown_count = 0
 local half_open_count = 0
 local disabled_count = 0
 local next_recovery_at = nil
+local now = tonumber(redis.call('TIME')[1])
 
 for index = 1, profile_count do
-  local profile_id = ARGV[index + 2]
+  local profile_id = ARGV[index + 5]
   if not is_profile_id(profile_id) then
     return redis.error_reply('invalid affinity profile identifier')
   end
@@ -190,11 +203,17 @@ for index = 1, profile_count do
     if next_recovery_at == nil or reset_at < next_recovery_at then
       next_recovery_at = reset_at
     end
+    if allow_recovery_probe == '1' and reset_at <= now then
+      table.insert(recoverable, {profile_id, state_key})
+    end
   elseif status == 'half_open' then
     half_open_count = half_open_count + 1
     local lease_until = tonumber(redis.call('HGET', state_key, 'lease_until'))
     if next_recovery_at == nil or lease_until < next_recovery_at then
       next_recovery_at = lease_until
+    end
+    if allow_recovery_probe == '1' and lease_until <= now then
+      table.insert(recoverable, {profile_id, state_key})
     end
   elseif status == 'disabled' then
     disabled_count = disabled_count + 1
@@ -203,6 +222,23 @@ end
 
 if current_is_available then
   return {'existing', current, tostring(current_ttl)}
+end
+
+if #recoverable > 0 then
+  local recovery_sequence = redis.call('INCR', KEYS[2])
+  local selected_recovery = recoverable[((recovery_sequence - 1) % #recoverable) + 1]
+  local selected_profile = selected_recovery[1]
+  local selected_state_key = selected_recovery[2]
+  local lease_until = now + lease_seconds
+  redis.call(
+    'HSET', selected_state_key,
+    'state', 'half_open',
+    'lease_token', lease_token,
+    'lease_until', tostring(lease_until),
+    'updated_at', tostring(now)
+  )
+  redis.call('SET', KEYS[1], selected_profile, 'EX', ttl)
+  return {'probe_assigned', selected_profile, tostring(ttl), tostring(lease_until)}
 end
 
 if #eligible == 0 then
@@ -298,6 +334,88 @@ end
 
 redis.call('DEL', KEYS[1])
 return {'applied', effective_state}
+"""
+)
+
+_COMPLETE_PROFILE_PROBE_SCRIPT: Final = (
+    _PROFILE_STATE_VALIDATION_LUA
+    + """
+local expected_profile = ARGV[1]
+local lease_token = ARGV[2]
+local target_state = ARGV[3]
+local reset_at = ARGV[4]
+local reason = ARGV[5]
+local binding_ttl = tonumber(ARGV[6])
+if #KEYS ~= 2 or #ARGV ~= 6 then
+  return redis.error_reply('invalid profile probe completion shape')
+end
+if not is_profile_id(expected_profile) or not is_lease_token(lease_token)
+  or binding_ttl == nil or binding_ttl <= 0 then
+  return redis.error_reply('invalid profile probe completion arguments')
+end
+
+local status = validate_profile_record(KEYS[1])
+if status == 'invalid' then
+  return {'invalid_state'}
+end
+if status ~= 'half_open' then
+  return {'stale'}
+end
+
+local now = tonumber(redis.call('TIME')[1])
+local current_token = redis.call('HGET', KEYS[1], 'lease_token')
+local lease_until = tonumber(redis.call('HGET', KEYS[1], 'lease_until'))
+if current_token ~= lease_token or lease_until <= now then
+  return {'stale'}
+end
+
+if target_state == 'available' then
+  if reset_at ~= '' or reason ~= '' then
+    return redis.error_reply('invalid available probe completion arguments')
+  end
+  redis.call('HSET', KEYS[1], 'state', 'available', 'updated_at', tostring(now))
+  redis.call('HDEL', KEYS[1], 'reset_at', 'lease_token', 'lease_until', 'reason')
+  local current_binding = redis.call('GET', KEYS[2])
+  if current_binding == expected_profile then
+    redis.call('EXPIRE', KEYS[2], binding_ttl)
+    return {'applied', 'refreshed'}
+  end
+  return {'applied', 'unchanged'}
+end
+
+if target_state == 'cooldown' then
+  if not is_positive_integer(reset_at, 253402300799) or not is_reason_code(reason) then
+    return redis.error_reply('invalid cooldown probe completion arguments')
+  end
+  redis.call(
+    'HSET', KEYS[1],
+    'state', 'cooldown',
+    'reset_at', reset_at,
+    'reason', reason,
+    'updated_at', tostring(now)
+  )
+  redis.call('HDEL', KEYS[1], 'lease_token', 'lease_until')
+elseif target_state == 'disabled' then
+  if reset_at ~= '' or not is_reason_code(reason) then
+    return redis.error_reply('invalid disabled probe completion arguments')
+  end
+  redis.call(
+    'HSET', KEYS[1],
+    'state', 'disabled',
+    'reason', reason,
+    'updated_at', tostring(now)
+  )
+  redis.call('HDEL', KEYS[1], 'reset_at', 'lease_token', 'lease_until')
+else
+  return redis.error_reply('invalid profile probe completion target')
+end
+
+local current_binding = redis.call('GET', KEYS[2])
+if current_binding == expected_profile then
+  redis.call('DEL', KEYS[2])
+  return {'applied', 'released'}
+end
+return {'applied', 'unchanged'}
 """
 )
 
@@ -499,6 +617,7 @@ class OpenAIProfileSelectionStatus(str, Enum):
     EXISTING = "existing"
     ASSIGNED = "assigned"
     REASSIGNED = "reassigned"
+    PROBE_ASSIGNED = "probe_assigned"
     UNAVAILABLE = "unavailable"
 
 
@@ -511,6 +630,7 @@ class OpenAIProfileSelection:
     half_open_profiles: int = 0
     disabled_profiles: int = 0
     next_recovery_at: int | None = None
+    half_open_lease: OpenAIProfileHalfOpenLease | None = field(default=None, repr=False)
 
 
 class OpenAIProfileFailureUpdateStatus(str, Enum):
@@ -524,6 +644,20 @@ class OpenAIProfileFailureUpdateStatus(str, Enum):
 class OpenAIProfileFailureUpdate:
     status: OpenAIProfileFailureUpdateStatus
     effective_state: OpenAIProfileState | None
+
+
+class OpenAIProfileProbeBindingAction(str, Enum):
+    """Effect of a probe completion on the probing key's affinity."""
+
+    REFRESHED = "refreshed"
+    RELEASED = "released"
+    UNCHANGED = "unchanged"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIProfileProbeCompletion:
+    applied: bool
+    binding_action: OpenAIProfileProbeBindingAction | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,8 +782,11 @@ class OpenAISubscriptionAffinityStore:
         user_api_key_hash: str,
         available_profile_ids: Sequence[str],
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        *,
+        allow_recovery_probe: bool = False,
+        half_open_lease_seconds: int = DEFAULT_HALF_OPEN_LEASE_SECONDS,
     ) -> OpenAIProfileSelection:
-        """Atomically preserve or assign a profile eligible for normal traffic.
+        """Atomically preserve, assign, or exclusively probe a profile.
 
         Profile order supplied by callers cannot affect distribution: identifiers
         are validated, de-duplicated, and sorted before the Redis script runs.
@@ -657,17 +794,31 @@ class OpenAISubscriptionAffinityStore:
         ``cooldown``, ``half_open`` and ``disabled`` profiles are excluded. An
         eligible existing binding is kept without refreshing its TTL; an
         unavailable or removed binding is replaced through the same shared
-        round-robin counter used for first assignments.
+        round-robin counter used for first assignments. When explicitly allowed,
+        a request without an available binding takes the sole lease for one
+        cooldown profile whose reset time has elapsed. Active bindings are never
+        moved merely to perform recovery checks.
         """
 
         cache_key: Final = self.get_cache_key(user_api_key_hash)
         profiles: Final = self._normalize_profile_ids(available_profile_ids)
         validated_ttl: Final = self._validate_ttl(ttl_seconds)
+        if not isinstance(allow_recovery_probe, bool):
+            raise ValueError("allow_recovery_probe must be a boolean")
+        validated_lease_seconds: Final = self._validate_half_open_lease_seconds(half_open_lease_seconds)
+        lease_token: Final = self._validate_half_open_lease_token(secrets.token_hex(16)) if allow_recovery_probe else ""
         state_keys: Final = tuple(self.get_profile_state_cache_key(profile_id) for profile_id in profiles)
         response: Final = await self._execute(
             _ASSIGN_PROFILE_SCRIPT,
             (cache_key, self.COUNTER_CACHE_KEY, *state_keys),
-            (str(validated_ttl), str(len(profiles)), *profiles),
+            (
+                str(validated_ttl),
+                str(len(profiles)),
+                "1" if allow_recovery_probe else "0",
+                lease_token,
+                str(validated_lease_seconds),
+                *profiles,
+            ),
         )
         if len(response) == 3 and response[0] in {
             OpenAIProfileSelectionStatus.EXISTING.value,
@@ -690,6 +841,30 @@ class OpenAISubscriptionAffinityStore:
                 status=status,
                 profile_id=profile_id,
                 remaining_ttl_seconds=remaining_ttl,
+            )
+
+        if len(response) == 4 and response[0] == OpenAIProfileSelectionStatus.PROBE_ASSIGNED.value:
+            try:
+                profile_id = self._validate_profile_id(response[1])
+                remaining_ttl = int(response[2])
+                lease_expires_at = self._validate_timestamp(int(response[3]), "lease_expires_at")
+            except (TypeError, ValueError) as exc:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription recovery assignment returned invalid data"
+                ) from exc
+            if not allow_recovery_probe or profile_id not in profiles or remaining_ttl != validated_ttl:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription recovery assignment returned invalid data"
+                )
+            return OpenAIProfileSelection(
+                status=OpenAIProfileSelectionStatus.PROBE_ASSIGNED,
+                profile_id=profile_id,
+                remaining_ttl_seconds=remaining_ttl,
+                half_open_lease=OpenAIProfileHalfOpenLease(
+                    profile_id=profile_id,
+                    token=lease_token,
+                    expires_at=lease_expires_at,
+                ),
             )
 
         if len(response) == 7 and response[0] == OpenAIProfileSelectionStatus.UNAVAILABLE.value:
@@ -726,6 +901,65 @@ class OpenAISubscriptionAffinityStore:
             )
 
         raise OpenAISubscriptionAffinityStoreError("OpenAI subscription affinity assignment returned invalid data")
+
+    async def complete_profile_probe_for_binding(
+        self,
+        user_api_key_hash: str,
+        profile_id: str,
+        lease_token: str,
+        target_state: OpenAIProfileState,
+        *,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        reset_at: int | None = None,
+        reason_code: str | None = None,
+    ) -> OpenAIProfileProbeCompletion:
+        """Complete a leased probe and safely update its affinity binding."""
+
+        cache_key: Final = self.get_cache_key(user_api_key_hash)
+        validated_profile_id: Final = self._validate_profile_id(profile_id)
+        validated_token: Final = self._validate_half_open_lease_token(lease_token)
+        validated_ttl: Final = self._validate_ttl(ttl_seconds)
+        if not isinstance(target_state, OpenAIProfileState) or target_state is OpenAIProfileState.HALF_OPEN:
+            raise ValueError("target_state must be available, cooldown or disabled")
+
+        validated_reset_at = ""
+        validated_reason = ""
+        if target_state is OpenAIProfileState.AVAILABLE:
+            if reset_at is not None or reason_code is not None:
+                raise ValueError("available target_state does not accept reset_at or reason_code")
+        elif target_state is OpenAIProfileState.COOLDOWN:
+            if reset_at is None or reason_code is None:
+                raise ValueError("cooldown target_state requires reset_at and reason_code")
+            validated_reset_at = str(self._validate_timestamp(reset_at, "reset_at"))
+            validated_reason = self._validate_reason_code(reason_code)
+        else:
+            if reset_at is not None or reason_code is None:
+                raise ValueError("disabled target_state requires reason_code without reset_at")
+            validated_reason = self._validate_reason_code(reason_code)
+
+        response: Final = await self._execute(
+            _COMPLETE_PROFILE_PROBE_SCRIPT,
+            (self.get_profile_state_cache_key(validated_profile_id), cache_key),
+            (
+                validated_profile_id,
+                validated_token,
+                target_state.value,
+                validated_reset_at,
+                validated_reason,
+                str(validated_ttl),
+            ),
+        )
+        if response == ("stale",):
+            return OpenAIProfileProbeCompletion(applied=False, binding_action=None)
+        if len(response) == 2 and response[0] == "applied":
+            try:
+                binding_action: Final = OpenAIProfileProbeBindingAction(response[1])
+            except ValueError as exc:
+                raise OpenAISubscriptionAffinityStoreError(
+                    "OpenAI subscription profile probe completion returned invalid data"
+                ) from exc
+            return OpenAIProfileProbeCompletion(applied=True, binding_action=binding_action)
+        raise OpenAISubscriptionAffinityStoreError("OpenAI subscription profile probe completion returned invalid data")
 
     async def fail_profile_if_current_binding(
         self,
