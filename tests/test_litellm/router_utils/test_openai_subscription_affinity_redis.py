@@ -13,6 +13,7 @@ import hashlib
 import os
 import time
 from collections import Counter
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
@@ -94,6 +95,34 @@ async def test_parallel_first_requests_converge_on_one_profile(
         )
         == "subscription-b"
     )
+
+
+@pytest.mark.asyncio
+async def test_parallel_distinct_key_assignments_are_even_and_order_independent(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    profile_orders = (
+        ["subscription-c", "subscription-a", "subscription-b"],
+        ["subscription-b", "subscription-c", "subscription-a"],
+        ["subscription-a", "subscription-b", "subscription-c"],
+    )
+
+    assigned = await asyncio.gather(
+        *(
+            affinity_store.get_or_assign_profile(
+                _user_hash(index),
+                profile_orders[index % len(profile_orders)],
+                ttl_seconds=60,
+            )
+            for index in range(90)
+        )
+    )
+
+    assert Counter(assigned) == {
+        "subscription-a": 30,
+        "subscription-b": 30,
+        "subscription-c": 30,
+    }
 
 
 @pytest.mark.asyncio
@@ -213,6 +242,49 @@ async def test_adding_profile_preserves_active_bindings_and_gradually_rebalances
         "subscription-c",
         "subscription-a",
     ]
+
+
+@pytest.mark.asyncio
+async def test_profile_added_during_parallel_traffic_preserves_active_bindings_and_receives_new_keys(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    original_hashes = [_user_hash(index) for index in range(600, 630)]
+    original_assignments = await asyncio.gather(
+        *(
+            affinity_store.get_or_assign_profile(
+                user_hash,
+                ["subscription-b", "subscription-a"],
+                ttl_seconds=300,
+            )
+            for user_hash in original_hashes
+        )
+    )
+    original_by_hash = dict(zip(original_hashes, original_assignments))
+    new_hashes = [_user_hash(index) for index in range(630, 690)]
+
+    mixed_results = await asyncio.gather(
+        *(
+            affinity_store.get_or_assign_profile(
+                user_hash,
+                ["subscription-c", "subscription-a", "subscription-b"],
+                ttl_seconds=3600,
+            )
+            for user_hash in (*original_hashes, *new_hashes)
+        )
+    )
+    preserved_results = mixed_results[: len(original_hashes)]
+    new_results = mixed_results[len(original_hashes) :]
+
+    assert dict(zip(original_hashes, preserved_results)) == original_by_hash
+    assert Counter(new_results) == {
+        "subscription-a": 20,
+        "subscription-b": 20,
+        "subscription-c": 20,
+    }
+    for user_hash in original_hashes:
+        remaining_ttl = await affinity_store.get_remaining_ttl(user_hash)
+        assert remaining_ttl is not None
+        assert remaining_ttl < 3600
 
 
 @pytest.mark.asyncio
@@ -480,6 +552,80 @@ async def test_parallel_failures_for_one_key_have_one_cas_winner(
     }
     assert await affinity_store.get_profile(user_hash) is None
     assert (await affinity_store.get_profile_state("subscription-a")).state is OpenAIProfileState.COOLDOWN
+
+
+@pytest.mark.asyncio
+async def test_parallel_failure_callbacks_publish_one_applied_failover(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(27)
+    profile_id = "subscription-a"
+    await affinity_store.set_profile(user_hash, profile_id, ttl_seconds=300)
+    metrics_logger = MagicMock()
+    callback = OpenAISubscriptionAffinityCheck(
+        store=affinity_store,
+        ttl_seconds=60,
+        metrics_logger=metrics_logger,
+    )
+    error = RuntimeError("provider response must not be inspected")
+    error.status_code = 429  # type: ignore[attr-defined]
+    error.headers = {"Retry-After": "120"}  # type: ignore[attr-defined]
+
+    await asyncio.gather(
+        *(
+            callback.async_log_failure_event(
+                {
+                    "exception": error,
+                    "standard_logging_object": {"metadata": {"user_api_key_hash": user_hash}},
+                    "litellm_params": {"model_info": {"openai_oauth_profile": profile_id}},
+                },
+                None,
+                0,
+                1,
+            )
+            for _ in range(64)
+        )
+    )
+
+    assert await affinity_store.get_profile(user_hash) is None
+    assert (await affinity_store.get_profile_state(profile_id)).state is OpenAIProfileState.COOLDOWN
+    metrics_logger.increment_openai_subscription_failover.assert_called_once_with(profile=profile_id)
+    metrics_logger.set_openai_subscription_profile_available.assert_called_once_with(
+        profile=profile_id,
+        available=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_success_and_failure_cannot_preserve_failed_binding(
+    affinity_store: OpenAISubscriptionAffinityStore,
+) -> None:
+    user_hash = _user_hash(28)
+    profile_id = "subscription-a"
+    await affinity_store.set_profile(user_hash, profile_id, ttl_seconds=5)
+    reset_at = int(time.time()) + 300
+
+    refreshed, update = await asyncio.gather(
+        affinity_store.refresh_profile_if_current(
+            user_hash,
+            profile_id,
+            ttl_seconds=300,
+        ),
+        affinity_store.fail_profile_if_current_binding(
+            user_hash,
+            profile_id,
+            OpenAIProfileState.COOLDOWN,
+            reset_at=reset_at,
+            reason_code="rate_limit",
+        ),
+    )
+
+    assert isinstance(refreshed, bool)
+    assert update.status is OpenAIProfileFailureUpdateStatus.APPLIED
+    assert await affinity_store.get_profile(user_hash) is None
+    snapshot = await affinity_store.get_profile_state(profile_id)
+    assert snapshot.state is OpenAIProfileState.COOLDOWN
+    assert snapshot.reset_at == reset_at
 
 
 @pytest.mark.asyncio
