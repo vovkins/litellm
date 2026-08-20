@@ -170,27 +170,42 @@ class ResponsesToCompletionBridgeHandler:
         if kwargs.get("stream") is True and "stream" not in optional_params:
             optional_params = {**optional_params, "stream": True}
 
-        request_data: Final = self.transformation_handler.transform_request(
-            model=model,
-            messages=messages,
-            optional_params=optional_params,
-            litellm_params=litellm_params,
-            headers=headers,
-            litellm_logging_obj=logging_obj,
-            client=kwargs.get("client"),
-        )
+        original_call_type: Final = logging_obj.call_type
+        original_stream: Final = logging_obj.stream
+        try:
+            request_data: Final = self.transformation_handler.transform_request(
+                model=model,
+                messages=messages,
+                optional_params=optional_params,
+                litellm_params=litellm_params,
+                headers=headers,
+                litellm_logging_obj=logging_obj,
+                client=kwargs.get("client"),
+            )
 
-        # Pin the resolved provider so `responses()` doesn't re-run
-        # `get_llm_provider()` on the model string and strip a second
-        # provider prefix (see GitHub issue #28505).  request_data already
-        # carries `custom_llm_provider` via the spread of
-        # `sanitized_litellm_params`; overwriting it on the dict (rather
-        # than adding an explicit kwarg) avoids the duplicate-keyword
-        # TypeError that would otherwise fire on the real bridge path.
-        request_data["custom_llm_provider"] = custom_llm_provider
-        result: Final = responses(
-            **request_data,
-        )
+            # Pin the resolved provider so `responses()` doesn't re-run
+            # `get_llm_provider()` on the model string and strip a second
+            # provider prefix (see GitHub issue #28505).  request_data already
+            # carries `custom_llm_provider` via the spread of
+            # `sanitized_litellm_params`; overwriting it on the dict (rather
+            # than adding an explicit kwarg) avoids the duplicate-keyword
+            # TypeError that would otherwise fire on the real bridge path.
+            request_data["custom_llm_provider"] = custom_llm_provider
+            from litellm._internal_context import is_internal_call
+
+            internal_call_token = is_internal_call.set(True)
+            try:
+                result: Final = responses(
+                    **request_data,
+                )
+            finally:
+                is_internal_call.reset(internal_call_token)
+        finally:
+            # The nested Responses call shares the parent's logging object and
+            # forces provider streaming. Keep those implementation details from
+            # leaking into the outer Chat Completions accounting lifecycle.
+            logging_obj.call_type = original_call_type
+            logging_obj.stream = original_stream
 
         from litellm.types.utils import ModelResponse
 
@@ -266,6 +281,8 @@ class ResponsesToCompletionBridgeHandler:
         if kwargs.get("stream") is True and "stream" not in optional_params:
             optional_params = {**optional_params, "stream": True}
 
+        original_call_type: Final = logging_obj.call_type
+        original_stream: Final = logging_obj.stream
         try:
             request_data: Final = self.transformation_handler.transform_request(
                 model=model,
@@ -275,20 +292,27 @@ class ResponsesToCompletionBridgeHandler:
                 headers=headers,
                 litellm_logging_obj=logging_obj,
             )
-        except Exception as e:
-            raise e
 
-        # Pin the resolved provider so `aresponses()` doesn't re-run
-        # `get_llm_provider()` on the model string and strip a second
-        # provider prefix (see GitHub issue #28505).  Set on request_data
-        # rather than passed as a separate kwarg to avoid the duplicate-
-        # keyword TypeError when `sanitized_litellm_params` already
-        # carries `custom_llm_provider`.
-        request_data["custom_llm_provider"] = custom_llm_provider
-        result: Final = await aresponses(
-            **request_data,
-            aresponses=True,
-        )
+            # Pin the resolved provider so `aresponses()` doesn't re-run
+            # `get_llm_provider()` on the model string and strip a second
+            # provider prefix (see GitHub issue #28505).  Set on request_data
+            # rather than passed as a separate kwarg to avoid the duplicate-
+            # keyword TypeError when `sanitized_litellm_params` already
+            # carries `custom_llm_provider`.
+            request_data["custom_llm_provider"] = custom_llm_provider
+            from litellm._internal_context import is_internal_call
+
+            internal_call_token = is_internal_call.set(True)
+            try:
+                result: Final = await aresponses(
+                    **request_data,
+                    aresponses=True,
+                )
+            finally:
+                is_internal_call.reset(internal_call_token)
+        finally:
+            logging_obj.call_type = original_call_type
+            logging_obj.stream = original_stream
 
         from litellm.types.utils import ModelResponse
 

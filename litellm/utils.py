@@ -1746,12 +1746,11 @@ def client(original_function):
                             is_completion_with_fallbacks=is_completion_with_fallbacks,
                         )
                     )
-
-            logging_obj.handle_sync_success_callbacks_for_async_calls(
-                result=result,
-                start_time=start_time,
-                end_time=end_time,
-            )
+                logging_obj.handle_sync_success_callbacks_for_async_calls(
+                    result=result,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
             # REBUILD EMBEDDING CACHING
             if (
                 isinstance(result, EmbeddingResponse)
@@ -2406,14 +2405,10 @@ def _is_explicitly_disabled_factory(model: str, custom_llm_provider: str | None,
         return False
 
 
-def _resolve_model_for_capability_check(
-    model: str, custom_llm_provider: str | None
-) -> tuple[str, str | None]:
+def _resolve_model_for_capability_check(model: str, custom_llm_provider: str | None) -> tuple[str, str | None]:
     if custom_llm_provider == "chatgpt" or model.startswith("chatgpt/"):
         return model.removeprefix("chatgpt/"), "chatgpt"
-    model, custom_llm_provider, _, _ = litellm.get_llm_provider(
-        model=model, custom_llm_provider=custom_llm_provider
-    )
+    model, custom_llm_provider, _, _ = litellm.get_llm_provider(model=model, custom_llm_provider=custom_llm_provider)
     return model, custom_llm_provider
 
 

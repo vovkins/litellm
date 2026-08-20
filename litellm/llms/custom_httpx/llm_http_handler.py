@@ -2528,7 +2528,10 @@ class BaseLLMHTTPHandler:
 
         if extra_body:
             data.update(extra_body)
-        stream = bool(stream or data.get("stream"))
+        provider_requires_streaming_body: Final = (
+            responses_api_provider_config.requires_streaming_request_body() is True
+        )
+        stream = bool(stream or (data.get("stream") and not provider_requires_streaming_body))
 
         # Preserve the OpenAI-style request context (not sent to the provider) for streaming
         # hooks/metadata; the streaming iterator now consumes this to run deployment hooks
@@ -2706,7 +2709,10 @@ class BaseLLMHTTPHandler:
 
         if extra_body:
             data.update(extra_body)
-        stream = bool(stream or data.get("stream"))
+        provider_requires_streaming_body: Final = (
+            responses_api_provider_config.requires_streaming_request_body() is True
+        )
+        stream = bool(stream or (data.get("stream") and not provider_requires_streaming_body))
 
         # Preserve the OpenAI-style request context (not sent to the provider) for streaming
         # hooks/metadata; the streaming iterator now consumes this to run deployment hooks

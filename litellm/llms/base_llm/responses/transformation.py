@@ -241,6 +241,14 @@ class BaseResponsesAPIConfig(ABC):
         """Returns True if litellm should fake a stream for the given model and stream value"""
         return False
 
+    def requires_streaming_request_body(self) -> bool:
+        """Whether the provider requires ``stream=true`` even for buffered client calls.
+
+        The HTTP handler still buffers and transforms the provider's SSE response
+        when the client did not request streaming.
+        """
+        return False
+
     def supports_native_websocket(self) -> bool:
         """
         Returns True if the provider has a native WebSocket endpoint for Responses API.

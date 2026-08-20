@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.abspath("../../.."))
 
+from litellm._internal_context import is_internal_call
 from litellm.completion_extras.litellm_responses_transformation.handler import (
     ResponsesToCompletionBridgeHandler,
 )
@@ -98,6 +99,77 @@ async def test_acompletion_returns_cached_model_response_directly():
         result = await bridge.acompletion(**_bridge_kwargs(stream=False))
 
     assert result is cached
+
+
+def test_completion_marks_nested_responses_call_as_internal():
+    cached = ModelResponse(id="chatcmpl-internal-sync", model="gpt-5.4")
+    bridge = ResponsesToCompletionBridgeHandler()
+    nested_internal_state = None
+    kwargs = _bridge_kwargs(stream=False)
+    logging_obj = kwargs["logging_obj"]
+
+    def fake_transform_request(**_kwargs):
+        logging_obj.call_type = "responses"
+        return {"model": "gpt-5.4", "input": "hi"}
+
+    def fake_responses(**_kwargs):
+        nonlocal nested_internal_state
+        nested_internal_state = is_internal_call.get()
+        logging_obj.stream = True
+        return cached
+
+    assert is_internal_call.get() is False
+    with (
+        patch.object(
+            bridge.transformation_handler,
+            "transform_request",
+            side_effect=fake_transform_request,
+        ),
+        patch("litellm.responses", side_effect=fake_responses),
+    ):
+        result = bridge.completion(**kwargs)
+
+    assert result is cached
+    assert nested_internal_state is True
+    assert is_internal_call.get() is False
+    assert logging_obj.call_type == "completion"
+    assert logging_obj.stream is False
+
+
+@pytest.mark.asyncio
+async def test_acompletion_marks_nested_responses_call_as_internal():
+    cached = ModelResponse(id="chatcmpl-internal-async", model="gpt-5.4")
+    bridge = ResponsesToCompletionBridgeHandler()
+    nested_internal_state = None
+    kwargs = _bridge_kwargs(stream=False)
+    logging_obj = kwargs["logging_obj"]
+
+    def fake_transform_request(**_kwargs):
+        logging_obj.call_type = "responses"
+        return {"model": "gpt-5.4", "input": "hi"}
+
+    async def fake_aresponses(**_kwargs):
+        nonlocal nested_internal_state
+        nested_internal_state = is_internal_call.get()
+        logging_obj.stream = True
+        return cached
+
+    assert is_internal_call.get() is False
+    with (
+        patch.object(
+            bridge.transformation_handler,
+            "transform_request",
+            side_effect=fake_transform_request,
+        ),
+        patch("litellm.aresponses", side_effect=fake_aresponses),
+    ):
+        result = await bridge.acompletion(**kwargs)
+
+    assert result is cached
+    assert nested_internal_state is True
+    assert is_internal_call.get() is False
+    assert logging_obj.call_type == "completion"
+    assert logging_obj.stream is False
 
 
 def test_completion_skips_rewrapping_preformatted_cached_chat_stream():

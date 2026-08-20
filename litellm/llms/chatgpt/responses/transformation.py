@@ -82,6 +82,14 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
+        if isinstance(request.get("input"), str):
+            request["input"] = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": request["input"]}],
+                }
+            ]
         base_instructions: Final = get_chatgpt_default_instructions()
         existing_instructions: Final = request.get("instructions")
         if existing_instructions:
@@ -252,3 +260,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def supports_native_websocket(self) -> bool:
         """ChatGPT does not support native WebSocket for Responses API"""
         return False
+
+    def requires_streaming_request_body(self) -> bool:
+        """The ChatGPT Codex backend always emits SSE responses."""
+        return True

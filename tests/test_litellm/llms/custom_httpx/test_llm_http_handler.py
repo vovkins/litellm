@@ -123,6 +123,46 @@ def test_response_api_handler_streams_when_provider_transform_adds_stream():
     assert client.post.call_args.kwargs["json"]["stream"] is True
 
 
+def test_response_api_handler_buffers_provider_required_stream_for_non_stream_client():
+    handler = BaseLLMHTTPHandler()
+    config = Mock()
+    config.validate_environment.return_value = {}
+    config.get_complete_url.return_value = "https://chatgpt.example.com/responses"
+    config.transform_responses_api_request.return_value = {
+        "model": "gpt-5.4",
+        "input": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+    config.requires_streaming_request_body.return_value = True
+    config.sign_request.return_value = ({}, None)
+    completed_response = Mock()
+    config.transform_response_api_response.return_value = completed_response
+    client = HTTPHandler(client=httpx.Client())
+    client.post = Mock(
+        return_value=httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://chatgpt.example.com/responses"),
+        )
+    )
+    logging_obj = Mock()
+    logging_obj.dynamic_success_callbacks = []
+
+    result = handler.response_api_handler(
+        model="gpt-5.4",
+        input="hi",
+        responses_api_provider_config=config,
+        response_api_optional_request_params={},
+        custom_llm_provider="chatgpt",
+        litellm_params=GenericLiteLLMParams(),
+        logging_obj=logging_obj,
+        client=client,
+    )
+
+    assert result is completed_response
+    assert "stream" not in client.post.call_args.kwargs
+    assert client.post.call_args.kwargs["json"]["stream"] is True
+
+
 def test_response_api_handler_runs_agentic_hooks_in_sync_path(monkeypatch):
     handler = BaseLLMHTTPHandler()
     config = Mock()
@@ -263,6 +303,47 @@ async def test_async_response_api_handler_streams_when_provider_transform_adds_s
     )
 
     assert client.post.call_args.kwargs["stream"] is True
+    assert client.post.call_args.kwargs["json"]["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_async_response_api_handler_buffers_provider_required_stream_for_non_stream_client():
+    handler = BaseLLMHTTPHandler()
+    config = Mock()
+    config.validate_environment.return_value = {}
+    config.get_complete_url.return_value = "https://chatgpt.example.com/responses"
+    config.transform_responses_api_request.return_value = {
+        "model": "gpt-5.4",
+        "input": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+    config.requires_streaming_request_body.return_value = True
+    config.sign_request.return_value = ({}, None)
+    completed_response = Mock()
+    config.transform_response_api_response.return_value = completed_response
+    client = AsyncHTTPHandler()
+    client.post = AsyncMock(
+        return_value=httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://chatgpt.example.com/responses"),
+        )
+    )
+    logging_obj = Mock()
+    logging_obj.dynamic_success_callbacks = []
+
+    result = await handler.async_response_api_handler(
+        model="gpt-5.4",
+        input="hi",
+        responses_api_provider_config=config,
+        response_api_optional_request_params={},
+        custom_llm_provider="chatgpt",
+        litellm_params=GenericLiteLLMParams(),
+        logging_obj=logging_obj,
+        client=client,
+    )
+
+    assert result is completed_response
+    assert "stream" not in client.post.call_args.kwargs
     assert client.post.call_args.kwargs["json"]["stream"] is True
 
 
