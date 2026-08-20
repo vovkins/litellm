@@ -17,6 +17,10 @@ class EmulatedOpenAIResponse:
     headers: Mapping[str, str] = field(default_factory=dict)
     delay_seconds: float = 0
     close_connection: bool = False
+    empty_completed_output: bool = False
+    responses_status: str = "completed"
+    incomplete_reason: str | None = None
+    response_error: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +163,17 @@ class OpenAISubscriptionEmulator:
             return
 
         if handler.path == "/responses":
-            self._write_sse(handler, self._responses_api_events(payload), response.headers)
+            self._write_sse(
+                handler,
+                self._responses_api_events(
+                    payload,
+                    empty_completed_output=response.empty_completed_output,
+                    status=response.responses_status,
+                    incomplete_reason=response.incomplete_reason,
+                    response_error=response.response_error,
+                ),
+                response.headers,
+            )
         elif payload.get("stream") is True:
             self._write_sse(handler, self._chat_completion_events(payload), response.headers)
         else:
@@ -221,15 +235,19 @@ class OpenAISubscriptionEmulator:
         )
 
     @staticmethod
-    def _responses_api_events(payload: Mapping[str, object]) -> tuple[dict[str, object], ...]:
+    def _responses_api_events(
+        payload: Mapping[str, object],
+        *,
+        empty_completed_output: bool = False,
+        status: str = "completed",
+        incomplete_reason: str | None = None,
+        response_error: Mapping[str, object] | None = None,
+    ) -> tuple[dict[str, object], ...]:
         model = payload.get("model") if isinstance(payload.get("model"), str) else "gpt-5.4"
-        response = {
-            "id": "resp_emulated",
-            "object": "response",
-            "created_at": 1700000000,
-            "status": "completed",
-            "model": model,
-            "output": [
+        output = (
+            []
+            if empty_completed_output or status != "completed"
+            else [
                 {
                     "id": "msg_emulated",
                     "type": "message",
@@ -243,8 +261,23 @@ class OpenAISubscriptionEmulator:
                         }
                     ],
                 }
-            ],
+            ]
+        )
+        response = {
+            "id": "resp_emulated",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": status,
+            "model": model,
+            "output": output,
         }
+        if incomplete_reason is not None:
+            response["incomplete_details"] = {"reason": incomplete_reason}
+        if response_error is not None:
+            response["error"] = dict(response_error)
+        if empty_completed_output or status != "completed":
+            event_type = "response.completed" if status == "completed" else f"response.{status}"
+            return ({"type": event_type, "response": response},)
         return (
             {
                 "type": "response.output_text.delta",

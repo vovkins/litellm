@@ -498,7 +498,13 @@ def get_llm_provider(
             raise Exception(f"dynamic_api_key needs to be a string. dynamic_api_key={dynamic_api_key}")
         return model, custom_llm_provider, dynamic_api_key, api_base
     except Exception as e:
-        if isinstance(e, litellm.exceptions.BadRequestError):
+        if isinstance(
+            e,
+            (
+                litellm.exceptions.BadRequestError,
+                litellm.exceptions.AuthenticationError,
+            ),
+        ):
             raise e
         else:
             error_str = f"GetLLMProvider Exception - {e}\n\noriginal model: {model}"

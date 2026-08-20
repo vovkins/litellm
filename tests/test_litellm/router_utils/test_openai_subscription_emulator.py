@@ -63,7 +63,9 @@ def _make_test_jwt(profile: str) -> str:
         raw = json.dumps(value, separators=(",", ":")).encode()
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
-    return f"{encode({'alg': 'none', 'typ': 'JWT'})}.{encode({'exp': int(time.time()) + 3600, 'test_profile': profile})}."
+    return (
+        f"{encode({'alg': 'none', 'typ': 'JWT'})}.{encode({'exp': int(time.time()) + 3600, 'test_profile': profile})}."
+    )
 
 
 def _write_auth_file(path: Path, token: str, profile: str) -> None:
@@ -210,6 +212,72 @@ async def test_real_router_reaches_emulator_and_persists_affinity(emulated_pool:
     assert request.path == "/responses"
     assert request.profile == PROFILE_A
     assert await emulated_pool.store.get_profile(user_hash) == PROFILE_A
+
+
+async def test_empty_completed_response_is_successful_without_retry_or_device_login(
+    emulated_pool: EmulatedPool,
+) -> None:
+    emulated_pool.emulator.enqueue(
+        PROFILE_A,
+        EmulatedOpenAIResponse(empty_completed_output=True),
+    )
+    router, _ = emulated_pool.make_router(models=("gpt-5.4",), num_retries=2)
+    user_hash = _user_hash(2)
+
+    response = await router.acompletion(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        metadata={"user_api_key_hash": user_hash},
+    )
+
+    assert response.choices[0].message.content == ""
+    assert [request.profile for request in emulated_pool.emulator.requests] == [PROFILE_A]
+    assert await emulated_pool.store.get_profile(user_hash) == PROFILE_A
+    assert not emulated_pool.device_login_attempts
+
+
+async def test_incomplete_response_is_not_retried_on_another_profile(
+    emulated_pool: EmulatedPool,
+) -> None:
+    emulated_pool.emulator.enqueue(
+        PROFILE_A,
+        EmulatedOpenAIResponse(
+            responses_status="incomplete",
+            incomplete_reason="max_output_tokens",
+        ),
+    )
+    router, _ = emulated_pool.make_router(models=("gpt-5.4",), num_retries=2)
+
+    with pytest.raises(litellm.BadRequestError, match="max_output_tokens"):
+        await router.acompletion(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hello"}],
+            metadata={"user_api_key_hash": _user_hash(3)},
+        )
+
+    assert [request.profile for request in emulated_pool.emulator.requests] == [PROFILE_A]
+    assert (await emulated_pool.store.get_profile_state(PROFILE_A)).state is OpenAIProfileState.AVAILABLE
+    assert not emulated_pool.device_login_attempts
+
+
+async def test_missing_auth_file_disables_only_that_profile_and_fails_over(
+    emulated_pool: EmulatedPool,
+) -> None:
+    router, _ = emulated_pool.make_router(models=("gpt-5.4",), num_retries=2)
+    emulated_pool.auth_files[PROFILE_A].unlink()
+    user_hash = _user_hash(4)
+
+    response = await router.acompletion(
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        metadata={"user_api_key_hash": user_hash},
+    )
+
+    assert response.choices[0].message.content == "emulated response"
+    assert [request.profile for request in emulated_pool.emulator.requests] == [PROFILE_B]
+    assert await emulated_pool.store.get_profile(user_hash) == PROFILE_B
+    assert (await emulated_pool.store.get_profile_state(PROFILE_A)).state is OpenAIProfileState.DISABLED
+    assert not emulated_pool.device_login_attempts
 
 
 async def test_parallel_real_requests_are_evenly_distributed(emulated_pool: EmulatedPool) -> None:

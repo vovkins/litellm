@@ -27,7 +27,9 @@ class ChatGPTConfig(OpenAIConfig):
         custom_llm_provider: str = "openai",
     ) -> None:
         super().__init__()
-        self.authenticator = Authenticator()
+        # Provider calls run inside a server process. Missing credentials must
+        # fail immediately instead of starting a blocking device-code flow.
+        self.authenticator = Authenticator(allow_interactive_login=False)
 
     def _resolve_authenticator(
         self, litellm_params: Mapping[str, object] | ChatGPTAuthFileParams | None
@@ -56,10 +58,11 @@ class ChatGPTConfig(OpenAIConfig):
         custom_llm_provider: str,
         litellm_params: Mapping[str, object] | ChatGPTAuthFileParams | None = None,
     ) -> tuple[str | None, str | None, str]:
-        authenticator: Final = self._resolve_authenticator(litellm_params)
-        dynamic_api_base: Final = authenticator.get_api_base()
-        dynamic_api_key: Final = self._get_access_token_or_raise(authenticator, model, custom_llm_provider)
-        return dynamic_api_base, dynamic_api_key, custom_llm_provider
+        # Provider discovery is also used by Router metadata and capability
+        # checks. Keep it credential-free; the selected deployment resolves its
+        # token in validate_environment immediately before the upstream call.
+        dynamic_api_base: Final = api_base or self.authenticator.get_api_base()
+        return dynamic_api_base, api_key, custom_llm_provider
 
     def validate_environment(
         self,
@@ -74,7 +77,9 @@ class ChatGPTConfig(OpenAIConfig):
         auth_file: Final = get_chatgpt_auth_file(litellm_params)
         authenticator: Final = get_cached_authenticator(auth_file) if auth_file else self.authenticator
         resolved_api_key: Final = (
-            self._get_access_token_or_raise(authenticator, model, "chatgpt") if auth_file else api_key
+            self._get_access_token_or_raise(authenticator, model, "chatgpt")
+            if auth_file or api_key is None
+            else api_key
         )
 
         validated_headers: Final = super().validate_environment(

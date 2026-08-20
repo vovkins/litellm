@@ -721,12 +721,17 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         """Transform Responses API response to chat completion response"""
         from litellm.responses.utils import ResponseAPILoggingUtils
         from litellm.types.llms.openai import ResponsesAPIResponse
+        from litellm.types.utils import Choices, Message
 
         if not isinstance(raw_response, ResponsesAPIResponse):
             raise ValueError(f"Unexpected response type: {type(raw_response)}")
 
         if raw_response.error is not None:
-            raise ValueError(f"Error in response: {raw_response.error}")
+            raise litellm.BadRequestError(
+                message=f"Responses API returned an error: {raw_response.error}",
+                model=model,
+                llm_provider=str(litellm_params.get("custom_llm_provider") or ""),
+            )
 
         output_items = raw_response.output
         if len(output_items) == 0:
@@ -746,10 +751,26 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         )
 
         if len(choices) == 0:
-            if raw_response.incomplete_details is not None and raw_response.incomplete_details.reason is not None:
-                raise ValueError(f"{model} unable to complete request: {raw_response.incomplete_details.reason}")
+            if raw_response.status == "completed" and len(output_items) == 0:
+                choices = [
+                    Choices(
+                        message=Message(role="assistant", content=""),
+                        finish_reason="stop",
+                        index=0,
+                    )
+                ]
+            elif raw_response.incomplete_details is not None and raw_response.incomplete_details.reason is not None:
+                raise litellm.BadRequestError(
+                    message=f"{model} unable to complete request: {raw_response.incomplete_details.reason}",
+                    model=model,
+                    llm_provider=str(litellm_params.get("custom_llm_provider") or ""),
+                )
             else:
-                raise ValueError(f"Unknown items in responses API response: {output_items}")
+                raise litellm.BadRequestError(
+                    message=f"Responses API returned no supported output items (status={raw_response.status})",
+                    model=model,
+                    llm_provider=str(litellm_params.get("custom_llm_provider") or ""),
+                )
 
         setattr(model_response, "choices", choices)
 

@@ -32,7 +32,9 @@ from ..common_utils import (
 class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     def __init__(self) -> None:
         super().__init__()
-        self.authenticator = Authenticator()
+        # Provider calls run inside a server process. Missing credentials must
+        # fail immediately instead of starting a blocking device-code flow.
+        self.authenticator = Authenticator(allow_interactive_login=False)
 
     @property
     def custom_llm_provider(self) -> LlmProviders:

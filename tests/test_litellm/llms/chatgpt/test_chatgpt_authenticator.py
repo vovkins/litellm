@@ -15,6 +15,9 @@ from litellm.llms.chatgpt.authenticator import (
     get_cached_authenticator,
     get_chatgpt_auth_file,
 )
+from litellm.llms.chatgpt.chat.transformation import ChatGPTConfig
+from litellm.llms.chatgpt.common_utils import GetAccessTokenError, RefreshAccessTokenError
+from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
 from litellm.types.router import GenericLiteLLMParams
 
 
@@ -91,6 +94,62 @@ def _write_auth_record(path, token: str, account_id: str) -> None:
 
 
 class TestChatGPTMultiAccountAuthenticator:
+    def test_provider_authenticators_disable_interactive_login(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CHATGPT_TOKEN_DIR", str(tmp_path / "default"))
+
+        assert ChatGPTConfig().authenticator.allow_interactive_login is False
+        assert ChatGPTResponsesAPIConfig().authenticator.allow_interactive_login is False
+        assert get_cached_authenticator(str(tmp_path / "profile" / "auth.json")).allow_interactive_login is False
+
+    def test_missing_profile_auth_file_fails_without_device_login(self, tmp_path):
+        authenticator = get_cached_authenticator(str(tmp_path / "missing" / "auth.json"))
+
+        with patch.object(
+            authenticator,
+            "_login_device_code",
+            side_effect=AssertionError("device login must not run in server mode"),
+        ) as device_login:
+            with pytest.raises(GetAccessTokenError, match="import a valid auth.json") as exc_info:
+                authenticator.get_access_token()
+
+        assert exc_info.value.status_code == 401
+        device_login.assert_not_called()
+
+    def test_failed_profile_refresh_fails_without_device_login(self, tmp_path):
+        auth_file = tmp_path / "expired" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text(
+            json.dumps(
+                {
+                    "access_token": "expired-token",
+                    "refresh_token": "invalid-refresh-token",
+                    "expires_at": time.time() - 10,
+                }
+            )
+        )
+        authenticator = get_cached_authenticator(str(auth_file))
+
+        with (
+            patch.object(
+                authenticator,
+                "_refresh_tokens",
+                side_effect=RefreshAccessTokenError(
+                    message="synthetic refresh failure",
+                    status_code=401,
+                ),
+            ),
+            patch.object(
+                authenticator,
+                "_login_device_code",
+                side_effect=AssertionError("device login must not run in server mode"),
+            ) as device_login,
+        ):
+            with pytest.raises(GetAccessTokenError, match="could not be refreshed") as exc_info:
+                authenticator.get_access_token()
+
+        assert exc_info.value.status_code == 401
+        device_login.assert_not_called()
+
     def test_router_initialization_uses_explicit_auth_file(self, tmp_path, monkeypatch):
         auth_file = tmp_path / "account-a" / "auth.json"
         _write_auth_record(auth_file, "token-a", "acct-a")

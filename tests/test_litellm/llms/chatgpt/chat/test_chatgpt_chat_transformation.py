@@ -82,17 +82,22 @@ class TestChatGPTMultiAccountChat:
         assert headers["Authorization"] == "Bearer token-default"
         assert headers["ChatGPT-Account-Id"] == "acct-default"
 
-    def test_provider_info_uses_per_model_auth_file(self, auth_files):
+    def test_provider_info_does_not_resolve_credentials(self, auth_files, monkeypatch):
         file_a, _ = auth_files
         config = ChatGPTConfig()
+        monkeypatch.setattr(
+            config,
+            "_get_access_token_or_raise",
+            lambda *_args, **_kwargs: pytest.fail("provider discovery must not read OAuth credentials"),
+        )
 
         _, per_model_key, _ = config._get_openai_compatible_provider_info(
             "gpt-5.4", None, None, "chatgpt", {"chatgpt_auth_file": str(file_a)}
         )
         _, default_key, _ = config._get_openai_compatible_provider_info("gpt-5.4", None, None, "chatgpt")
 
-        assert per_model_key == "token-a"
-        assert default_key == "token-default"
+        assert per_model_key is None
+        assert default_key is None
 
     def test_get_llm_provider_threads_auth_file(self, auth_files):
         file_a, _ = auth_files
@@ -104,4 +109,19 @@ class TestChatGPTMultiAccountChat:
 
         assert model == "gpt-5.4"
         assert provider == "chatgpt"
-        assert dynamic_api_key == "token-a"
+        assert dynamic_api_key is None
+
+    def test_validate_environment_resolves_default_auth_file_without_dynamic_key(self, auth_files):
+        config = ChatGPTConfig()
+
+        headers = config.validate_environment(
+            headers={},
+            model="gpt-5.4",
+            messages=[],
+            optional_params={},
+            litellm_params={},
+            api_key=None,
+        )
+
+        assert headers["Authorization"] == "Bearer token-default"
+        assert headers["ChatGPT-Account-Id"] == "acct-default"

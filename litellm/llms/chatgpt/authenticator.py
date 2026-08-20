@@ -87,7 +87,7 @@ def normalize_chatgpt_auth_file(auth_file: str) -> str:
 
 @lru_cache(maxsize=128)
 def _get_cached_authenticator(auth_file: str) -> "Authenticator":
-    return Authenticator(auth_file=auth_file)
+    return Authenticator(auth_file=auth_file, allow_interactive_login=False)
 
 
 def get_cached_authenticator(auth_file: str) -> "Authenticator":
@@ -95,13 +95,19 @@ def get_cached_authenticator(auth_file: str) -> "Authenticator":
 
 
 class Authenticator:
-    def __init__(self, auth_file: str | None = None) -> None:
+    def __init__(
+        self,
+        auth_file: str | None = None,
+        *,
+        allow_interactive_login: bool = True,
+    ) -> None:
         default_auth_file: Final = os.path.join(
             os.getenv("CHATGPT_TOKEN_DIR", os.path.expanduser("~/.config/litellm/chatgpt")),
             os.getenv("CHATGPT_AUTH_FILE", "auth.json"),
         )
         self.auth_file = normalize_chatgpt_auth_file(auth_file or default_auth_file)
         self.token_dir = os.path.dirname(self.auth_file)
+        self.allow_interactive_login = allow_interactive_login
         self._ensure_token_dir()
 
     def get_api_base(self) -> str:
@@ -123,6 +129,15 @@ class Authenticator:
                     return refreshed["access_token"]
                 except RefreshAccessTokenError as exc:
                     verbose_logger.warning("ChatGPT refresh token failed, re-login required: %s", exc)
+
+        if not self.allow_interactive_login:
+            raise GetAccessTokenError(
+                message=(
+                    "ChatGPT OAuth session is missing, expired, or could not be refreshed; "
+                    "import a valid auth.json for this deployment"
+                ),
+                status_code=401,
+            )
 
         cooldown_remaining: Final = self._get_device_code_cooldown_remaining(auth_data)
         if cooldown_remaining > 0:

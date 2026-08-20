@@ -569,6 +569,88 @@ def _make_empty_model_response():
     )
 
 
+def test_transform_response_accepts_completed_response_with_empty_output():
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        LiteLLMResponsesTransformationHandler,
+    )
+
+    handler = LiteLLMResponsesTransformationHandler()
+    logging_obj = Mock()
+    logging_obj.model_call_details = {
+        "original_response": (
+            'data: {"type":"response.completed","response":'
+            '{"id":"resp_from_stream","object":"response","created_at":1760144904,'
+            '"status":"completed","model":"gpt-5.4","output":[]}}\n\n'
+            "data: [DONE]\n\n"
+        )
+    }
+
+    result = handler.transform_response(
+        model="gpt-5.4",
+        raw_response=_make_empty_responses_api_response(),
+        model_response=_make_empty_model_response(),
+        logging_obj=logging_obj,
+        request_data={"model": "gpt-5.4"},
+        messages=[{"role": "user", "content": "Reply with exactly: ok"}],
+        optional_params={},
+        litellm_params={},
+        encoding=Mock(),
+    )
+
+    assert len(result.choices) == 1
+    assert result.choices[0].finish_reason == "stop"
+    assert result.choices[0].message.role == "assistant"
+    assert result.choices[0].message.content == ""
+
+
+def test_transform_response_rejects_incomplete_empty_output_as_bad_request():
+    from openai.types.responses.response import IncompleteDetails
+
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        LiteLLMResponsesTransformationHandler,
+    )
+
+    raw_response = _make_empty_responses_api_response()
+    raw_response.status = "incomplete"
+    raw_response.incomplete_details = IncompleteDetails(reason="max_output_tokens")
+
+    with pytest.raises(litellm.BadRequestError, match="max_output_tokens"):
+        LiteLLMResponsesTransformationHandler().transform_response(
+            model="gpt-5.4",
+            raw_response=raw_response,
+            model_response=_make_empty_model_response(),
+            logging_obj=Mock(model_call_details={}),
+            request_data={"model": "gpt-5.4"},
+            messages=[{"role": "user", "content": "hello"}],
+            optional_params={},
+            litellm_params={"custom_llm_provider": "chatgpt"},
+            encoding=Mock(),
+        )
+
+
+def test_transform_response_rejects_failed_response_as_bad_request():
+    from litellm.completion_extras.litellm_responses_transformation.transformation import (
+        LiteLLMResponsesTransformationHandler,
+    )
+
+    raw_response = _make_empty_responses_api_response()
+    raw_response.status = "failed"
+    raw_response.error = {"code": "server_error", "message": "provider failed"}
+
+    with pytest.raises(litellm.BadRequestError, match="provider failed"):
+        LiteLLMResponsesTransformationHandler().transform_response(
+            model="gpt-5.4",
+            raw_response=raw_response,
+            model_response=_make_empty_model_response(),
+            logging_obj=Mock(model_call_details={}),
+            request_data={"model": "gpt-5.4"},
+            messages=[{"role": "user", "content": "hello"}],
+            optional_params={},
+            litellm_params={"custom_llm_provider": "chatgpt"},
+            encoding=Mock(),
+        )
+
+
 def test_transform_response_recovers_empty_output_from_raw_sse():
     from litellm.completion_extras.litellm_responses_transformation.transformation import (
         LiteLLMResponsesTransformationHandler,

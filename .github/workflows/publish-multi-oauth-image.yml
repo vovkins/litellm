@@ -9,7 +9,7 @@ on:
       version:
         description: "Immutable image version, for example 1.97.0-multi-oauth.4"
         required: true
-        default: "1.97.0-multi-oauth.8"
+        default: "1.97.0-multi-oauth.9"
         type: string
       commit_sha:
         description: "Full 40-character commit SHA to build"
